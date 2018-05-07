@@ -15,22 +15,75 @@ import (
 	interp "github.com/cosmos72/gomacro/fast"
 )
 
-func extractLastExpr(stmt ast.Stmt) ast.Expr {
+func extractLastExpr(stmt ast.Stmt, curPos int) ast.Expr {
+
+    log.Printf("Extract statement from %T\n", stmt)
 
     switch s := stmt.(type) {
-    case *ast.ForStmt:
-        // TODO(jpark): check Init, Cond, Post if Body is null
-        if s.Body != nil && len(s.Body.List) > 0 {
-            stmtList := s.Body.List
-            return extractLastExpr(stmtList[len(stmtList)-1])
-        }
     case *ast.AssignStmt:
         if len(s.Rhs) > 0 {
-            return s.Rhs[len(s.Rhs)-1];
+            return s.Rhs[len(s.Rhs)-1]
+        }
+    case *ast.BlockStmt:
+        if len(s.List) > 0 {
+            return extractLastExpr(s.List[len(s.List)-1], curPos)
         }
     case *ast.ExprStmt:
         return s.X
+    case *ast.ForStmt:
+        // TODO(jpark):
+        //  we need to define variables in the Init statement
+        log.Printf("Init %T\n", s.Init)
+
+        if s.Body != nil && int(s.Body.Lbrace) <= curPos {
+            return extractLastExpr(s.Body, curPos)
+        } else if s.Post != nil {
+            return extractLastExpr(s.Post, curPos)
+        } else if s.Cond != nil {
+            return s.Cond
+        } else {
+            return extractLastExpr(s.Init, curPos)
+        }
+    case *ast.IfStmt:
+        if s.Else != nil {
+            return extractLastExpr(s.Else, curPos)
+        } else if s.Body != nil && int(s.Body.Lbrace) <= curPos {
+            return extractLastExpr(s.Body, curPos)
+        } else if s.Cond != nil {
+            return s.Cond
+        } else {
+            return extractLastExpr(s.Init, curPos)
+        }
+    /*
+    case *ast.CaseClause:
+    case *ast.SwitchStmt:
+    case *ast.TypeSwitchStmt:
+    case *ast.CommClause:
+    case *ast.SelectStmt:
+    */
+    case *ast.LabeledStmt:
+        return extractLastExpr(s.Stmt, curPos)
+    case *ast.RangeStmt:
+        // TODO(jpark): 
+        //  we need to define variables for key, value
+        if s.Body != nil && int(s.Body.Lbrace) <= curPos {
+            return extractLastExpr(s.Body, curPos)
+        } else {
+            return s.X  // value to range over
+        }
+        // no need to check further since we know
+        // cursor is already after 'range' keyword
+    case *ast.ReturnStmt:
+        if len(s.Results) > 0 {
+            return s.Results[len(s.Results)-1]
+        }
+    case *ast.SendStmt:
+        return s.Value
     default:
+        // Ignored statements: 
+        //      DeclStmt, EmptyStmt, IncDecStmt, GoStmt, BranchStmt
+        // Statement not supported
+        //      DeferStmt
         log.Printf("Unhandled statement type: %T\n", s)
     }
 
@@ -75,7 +128,7 @@ func parsePartial(src []byte) ([]ast.Stmt, ast.Expr) {
     lastStmt := stmts[len(stmts)-1]
 
     // extract expression from the last statement
-    expr := extractLastExpr(lastStmt)
+    expr := extractLastExpr(lastStmt, len(src))
 
     return prevStmts, expr
 }
