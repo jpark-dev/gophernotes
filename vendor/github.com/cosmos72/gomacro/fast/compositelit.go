@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -30,11 +30,18 @@ import (
 	r "reflect"
 
 	. "github.com/cosmos72/gomacro/base"
+	"github.com/cosmos72/gomacro/base/untyped"
 	xr "github.com/cosmos72/gomacro/xreflect"
 )
 
-func (c *Comp) CompositeLit(node *ast.CompositeLit) *Expr {
-	t, ellipsis := c.compileType2(node.Type, false)
+func (c *Comp) CompositeLit(node *ast.CompositeLit, t xr.Type) *Expr {
+	var ellipsis bool
+	// node.Type is nil when exploiting type inference
+	if node.Type != nil {
+		t, ellipsis = c.compileType2(node.Type, false)
+	} else if t == nil {
+		c.Errorf("no explicit type and no inferred type, cannot compile composite literal: %v", node)
+	}
 	switch t.Kind() {
 	case r.Array:
 		return c.compositeLitArray(t, ellipsis, node)
@@ -44,6 +51,9 @@ func (c *Comp) CompositeLit(node *ast.CompositeLit) *Expr {
 		return c.compositeLitSlice(t, node)
 	case r.Struct:
 		return c.compositeLitStruct(t, node)
+	case r.Ptr:
+		// support pointer-to-literal in composite literals
+		return c.addressOf(node, t)
 	default:
 		c.Errorf("invalid type for composite literal: <%v> %v", t, node.Type)
 		return nil
@@ -62,7 +72,7 @@ func (c *Comp) compositeLitArray(t xr.Type, ellipsis bool, node *ast.CompositeLi
 	size, keys, funvals := c.compositeLitElements(t, ellipsis, node)
 	if ellipsis {
 		// rebuild type with correct length
-		t = xr.ArrayOf(size, t.Elem())
+		t = c.Universe.ArrayOf(size, t.Elem())
 		rtype = t.ReflectType()
 	}
 
@@ -126,13 +136,13 @@ func (c *Comp) compositeLitElements(t xr.Type, ellipsis bool, node *ast.Composit
 		elv := el
 		switch elkv := el.(type) {
 		case *ast.KeyValueExpr:
-			ekey := c.Expr1(elkv.Key)
+			ekey := c.Expr1(elkv.Key, nil)
 			if !ekey.Const() {
 				c.Errorf("literal %s index must be non-negative integer constant: %v", t.Kind(), elkv.Key)
 			} else if ekey.Untyped() {
 				key = ekey.ConstTo(c.TypeOfInt()).(int)
 			} else {
-				key = convertLiteralCheckOverflow(ekey.Value, c.TypeOfInt()).(int)
+				key = untyped.ConvertLiteralCheckOverflow(ekey.Value, c.TypeOfInt()).(int)
 			}
 			lastkey = key
 			elv = elkv.Value
@@ -155,7 +165,7 @@ func (c *Comp) compositeLitElements(t xr.Type, ellipsis bool, node *ast.Composit
 		}
 		keys[i] = lastkey
 
-		eval := c.Expr1(elv)
+		eval := c.Expr1(elv, tval)
 		if eval.Const() {
 			eval.ConstTo(tval)
 		} else if !eval.Type.AssignableTo(tval) {
@@ -186,7 +196,7 @@ func (c *Comp) compositeLitMap(t xr.Type, node *ast.CompositeLit) *Expr {
 	for i, el := range node.Elts {
 		switch elkv := el.(type) {
 		case *ast.KeyValueExpr:
-			ekey := c.Expr1(elkv.Key)
+			ekey := c.Expr1(elkv.Key, tkey)
 			if ekey.Const() {
 				ekey.ConstTo(tkey)
 				if seen[ekey.Value] {
@@ -198,7 +208,7 @@ func (c *Comp) compositeLitMap(t xr.Type, node *ast.CompositeLit) *Expr {
 			} else {
 				ekey.To(c, tkey)
 			}
-			eval := c.Expr1(elkv.Value)
+			eval := c.Expr1(elkv.Value, tval)
 			if eval.Const() {
 				eval.ConstTo(tval)
 			} else if !eval.Type.AssignableTo(tval) {
@@ -260,7 +270,7 @@ func (c *Comp) compositeLitStruct(t xr.Type, node *ast.CompositeLit) *Expr {
 				if !ok {
 					c.Errorf("unknown field '%v' in struct literal of type %v", name, t)
 				}
-				expr := c.Expr1(elkv.Value)
+				expr := c.Expr1(elkv.Value, field.Type)
 				if expr.Const() {
 					expr.ConstTo(field.Type)
 				} else if !expr.Type.AssignableTo(field.Type) {
@@ -279,7 +289,7 @@ func (c *Comp) compositeLitStruct(t xr.Type, node *ast.CompositeLit) *Expr {
 				c.Errorf("mixture of field:value and value in struct literal: %v", node)
 			}
 			field := t.Field(i)
-			expr := c.Expr1(el)
+			expr := c.Expr1(el, field.Type)
 			if expr.Const() {
 				expr.ConstTo(field.Type)
 			} else if !expr.Type.AssignableTo(field.Type) {

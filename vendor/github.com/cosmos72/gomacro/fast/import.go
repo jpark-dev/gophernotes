@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -27,14 +27,89 @@ package fast
 
 import (
 	"go/ast"
-	"go/types"
 	r "reflect"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	. "github.com/cosmos72/gomacro/base"
 	xr "github.com/cosmos72/gomacro/xreflect"
 )
+
+// =========================== forget package ==================================
+
+// remove package 'path' from the list of known packages.
+// later attempts to import it again will trigger a recompile.
+func (g *CompGlobals) UnloadPackage(path string) {
+	g.Globals.UnloadPackage(path)
+	delete(g.KnownImports, path)
+}
+
+// ========================== switch to package ================================
+
+func (ir *Interp) ChangePackage(name, path string) {
+	if len(path) == 0 {
+		path = name
+	} else {
+		name = FileName(path)
+	}
+	c := ir.Comp
+	if path == c.Path {
+		return
+	}
+	// load requested package if it exists, but do not define any binding in current one
+	newp, err := c.ImportPackageOrError("_", path)
+	if err != nil {
+		c.Debugf("%v", err)
+	}
+	oldp := ir.asImport()
+
+	c.CompGlobals.KnownImports[oldp.Path] = oldp // overwrite any cached import with same path as current Interp
+
+	top := &Interp{c.TopComp(), ir.env.Top()}
+	if newp != nil {
+		newp.Name = name
+		*ir = newp.asInterpreter(top)
+		c.Debugf("switched to package %v", newp)
+	} else {
+		// requested package does not exist - create an empty one
+		ir.Comp = NewComp(top.Comp, nil)
+		ir.env = NewEnv(top.env, 0, 0)
+		if c.Globals.Options&OptDebugger != 0 {
+			ir.env.DebugComp = ir.Comp
+		}
+		ir.Comp.Name = name
+		ir.Comp.Path = path
+		c.Debugf("switched to new package %v", path)
+	}
+	ir.env.ThreadGlobals.PackagePath = path
+}
+
+// convert *Interp to *Import. used to change package from 'ir'
+func (ir *Interp) asImport() *Import {
+	env := ir.env
+	env.UsedByClosure = true // do not try to recycle this Env
+	return &Import{
+		CompBinds: ir.Comp.CompBinds,
+		EnvBinds:  &ir.env.EnvBinds,
+		env:       env,
+	}
+}
+
+// convert *Import to *Interp. used to change package to 'imp'
+func (imp *Import) asInterpreter(outer *Interp) Interp {
+	c := NewComp(outer.Comp, nil)
+	c.CompBinds = imp.CompBinds
+	env := imp.env
+	// preserve env.IP, env.Code[], env.DebugPos[]
+	if env.Outer == nil {
+		env.Outer = outer.env
+	}
+	env.ThreadGlobals = outer.env.ThreadGlobals
+	return Interp{c, env}
+}
+
+// =========================== import package =================================
 
 // Import compiles an import statement
 func (c *Comp) Import(node ast.Spec) {
@@ -50,7 +125,7 @@ func (c *Comp) Import(node ast.Spec) {
 		if node.Name != nil {
 			name = node.Name.Name
 		} else {
-			name = path[1+strings.LastIndexByte(path, '/'):]
+			name = FileName(path)
 		}
 		// yes, we support local imports
 		// i.e. a function or block can import packages
@@ -60,7 +135,7 @@ func (c *Comp) Import(node ast.Spec) {
 	}
 }
 
-func (g *CompThreadGlobals) sanitizeImportPath(path string) string {
+func (g *CompGlobals) sanitizeImportPath(path string) string {
 	path = strings.Replace(path, "\\", "/", -1)
 	l := len(path)
 	if path == ".." || l >= 3 && (path[:3] == "../" || path[l-3:] == "/..") || strings.Contains(path, "/../") {
@@ -72,85 +147,190 @@ func (g *CompThreadGlobals) sanitizeImportPath(path string) string {
 	return path
 }
 
-// Import imports a package. Usually invoked as Comp.FileComp().ImportPackage(name, path)
+// ImportPackage imports a package. Usually invoked as Comp.FileComp().ImportPackage(name, path)
 // because imports are usually top-level statements in a source file.
 // But we also support local imports, i.e. import statements inside a function or block.
-func (c *Comp) ImportPackage(name, path string) *Import {
-	g := c.CompThreadGlobals
-	pkgref := g.ImportPackage(name, path)
-	if pkgref == nil {
-		return nil
+func (c *Comp) ImportPackage(name, path string) {
+	_, err := c.ImportPackageOrError(name, path)
+	if err != nil {
+		panic(err)
 	}
-	binds, bindtypes := g.parseImportBinds(pkgref.Binds, pkgref.Untypeds)
-
-	imp := Import{
-		Binds:     binds,
-		BindTypes: bindtypes,
-		Types:     g.parseImportTypes(pkgref.Types, pkgref.Wrappers),
-		Name:      name,
-		Path:      path,
-	}
-
-	g.loadProxies(pkgref.Proxies, imp.Types)
-
-	c.declImport0(name, imp)
-	return &imp
 }
 
-// declImport0 compiles an import declaration.
+func (c *Comp) ImportPackageOrError(name, path string) (*Import, error) {
+	g := c.CompGlobals
+	imp := g.KnownImports[path]
+	if imp == nil {
+		pkgref, err := g.ImportPackageOrError(name, path)
+		if err != nil {
+			return nil, err
+		}
+		imp = g.NewImport(pkgref)
+	}
+	if name == "." {
+		c.declDotImport0(imp)
+	} else if name != "_" {
+		c.declImport0(name, imp)
+	}
+	g.KnownImports[path] = imp
+	return imp, nil
+}
+
+// declDotImport0 compiles an import declaration.
 // Note: does not loads proxies, use ImportPackage for that
-func (c *Comp) declImport0(name string, imp Import) {
+func (c *Comp) declImport0(name string, imp *Import) {
 	// treat imported package as a constant,
 	// because to compile code we need the declarations it contains:
 	// importing them at runtime would be too late.
-	t := c.TypeOfImport()
-	bind := c.AddBind(name, ConstBind, t)
-	bind.Value = imp // cfile.Binds[] is a map[string]*Bind => changes to *Bind propagate to the map
+	bind := c.AddBind(name, ConstBind, c.TypeOfPtrImport())
+	bind.Value = imp // Comp.Binds[] is a map[string]*Bind => changes to *Bind propagate to the map
 }
 
-func (g *CompThreadGlobals) parseImportBinds(binds map[string]r.Value, untypeds map[string]string) (map[string]r.Value, map[string]xr.Type) {
-	retbinds := make(map[string]r.Value)
-	rettypes := make(map[string]xr.Type)
-	for name, bind := range binds {
+// declDotImport0 compiles an import . "path" declaration, i.e. a dot-import.
+// Note: does not loads proxies, use ImportPackage for that
+func (c *Comp) declDotImport0(imp *Import) {
+	// Note 2: looking at the difference between the above Comp.declImport0() and this ugly monster,
+	// shows one more reason why dot-imports are dirty and discouraged.
+	if c.Types == nil {
+		c.Types = make(map[string]xr.Type)
+	}
+	for name, typ := range imp.Types {
+		if t, exists := c.Types[name]; exists {
+			c.Warnf("redefined type: %v", t)
+		}
+		c.Types[name] = typ
+	}
+
+	var indexv, cindexv []int // mapping between Import.Vals[index] and Env.Vals[cindex]
+
+	var funv []func(*Env) r.Value
+	var findexv []int
+
+	for name, bind := range imp.Binds {
+		// use c.CompBinds.AddBind() to prevent optimization VarBind -> IntBind
+		// also, if class == IntBind, we must preserve the address of impenv.Ints[idx]
+		// thus we must convert it into a VarBind (argh!)
+		class := bind.Desc.Class()
+		if class == IntBind {
+			class = VarBind
+		}
+		cbind := c.CompBinds.AddBind(&c.Output, name, class, bind.Type)
+		cidx := cbind.Desc.Index()
+		switch bind.Desc.Class() {
+		case ConstBind:
+			cbind.Value = bind.Value
+		case IntBind:
+			if cidx == NoIndex {
+				continue
+			}
+			// this is painful. and slow
+			fun := imp.intPlace(c, bind, PlaceSettable).Fun
+			funv = append(funv, fun)
+			findexv = append(findexv, cidx)
+		default:
+			if cidx == NoIndex {
+				continue
+			}
+			indexv = append(indexv, bind.Desc.Index())
+			cindexv = append(cindexv, cidx)
+		}
+	}
+	if len(indexv) != 0 || len(funv) != 0 {
+		impvals := imp.Vals
+		c.append(func(env *Env) (Stmt, *Env) {
+			for i, index := range indexv {
+				env.Vals[cindexv[i]] = impvals[index]
+			}
+			for i, fun := range funv {
+				env.Vals[findexv[i]] = fun(nil) // fun(env) is unnecessary
+			}
+			env.IP++
+			return env.Code[env.IP], env
+		})
+	}
+}
+
+func (g *CompGlobals) NewImport(pkgref *PackageRef) *Import {
+	env := &Env{
+		UsedByClosure: true, // do not try to recycle this Env
+	}
+	imp := &Import{
+		EnvBinds: &env.EnvBinds,
+		env:      env,
+	}
+	if pkgref != nil {
+		imp.Name = pkgref.Name
+		imp.Path = pkgref.Path
+		imp.loadBinds(g, pkgref)
+		imp.loadTypes(g, pkgref)
+		g.loadProxies(pkgref.Proxies, imp.Types)
+	}
+	return imp
+}
+
+func (imp *Import) loadBinds(g *CompGlobals, pkgref *PackageRef) {
+	vals := make([]r.Value, len(pkgref.Binds))
+	untypeds := pkgref.Untypeds
+	o := &g.Output
+	for name, val := range pkgref.Binds {
 		if untyped, ok := untypeds[name]; ok {
-			value, typ, ok := g.parseImportUntyped(untyped)
+			val, typ, ok := g.parseUntyped(untyped)
 			if ok {
-				retbinds[name] = value
-				rettypes[name] = typ
+				bind := imp.CompBinds.AddBind(o, name, ConstBind, typ)
+				bind.Value = val.Interface()
 				continue
 			}
 		}
-		retbinds[name] = bind
-		rettypes[name] = g.Universe.FromReflectType(bind.Type())
+		k := val.Kind()
+		class := FuncBind
+		// distinguish typed constants, variables and functions
+		if val.IsValid() && val.CanAddr() && val.CanSet() {
+			class = VarBind
+		} else if k == r.Invalid || (IsOptimizedKind(k) && val.CanInterface()) {
+			class = ConstBind
+		}
+		typ := g.Universe.FromReflectType(val.Type())
+		bind := imp.CompBinds.AddBind(o, name, class, typ)
+		if class == ConstBind && k != r.Invalid {
+			bind.Value = val.Interface()
+		}
+		idx := bind.Desc.Index()
+		if len(vals) <= idx {
+			tmp := make([]r.Value, idx*2)
+			copy(tmp, vals)
+			vals = tmp
+		}
+		vals[idx] = val
 	}
-	return retbinds, rettypes
+	imp.Vals = vals
 }
 
-func (g *CompThreadGlobals) parseImportUntyped(untyped string) (r.Value, xr.Type, bool) {
-	gkind, value := UnmarshalUntyped(untyped)
-	if gkind == types.Invalid {
+func (g *CompGlobals) parseUntyped(untyped string) (r.Value, xr.Type, bool) {
+	kind, value := UnmarshalUntyped(untyped)
+	if kind == r.Invalid {
 		return Nil, nil, false
 	}
-	lit := UntypedLit{Kind: xr.ToReflectKind(gkind), Obj: value, Universe: g.Universe}
+	lit := MakeUntypedLit(kind, value, &g.Universe.BasicTypes)
 	return r.ValueOf(lit), g.TypeOfUntypedLit(), true
 }
 
-func (g *CompThreadGlobals) parseImportTypes(rtypes map[string]r.Type, wrappers map[string][]string) map[string]xr.Type {
+func (imp *Import) loadTypes(g *CompGlobals, pkgref *PackageRef) {
 	v := g.Universe
-	xtypes := make(map[string]xr.Type)
-	for name, rtype := range rtypes {
+	types := make(map[string]xr.Type)
+	wrappers := pkgref.Wrappers
+	for name, rtype := range pkgref.Types {
 		// Universe.FromReflectType uses cached *types.Package if possible
 		t := v.FromReflectType(rtype)
 		if twrappers := wrappers[name]; len(twrappers) != 0 {
 			t.RemoveMethods(twrappers, "")
 		}
-		xtypes[name] = t
+		types[name] = t
 	}
-	return xtypes
+	imp.Types = types
 }
 
 // loadProxies adds to thread-global maps the proxies found in import
-func (g *CompThreadGlobals) loadProxies(proxies map[string]r.Type, xtypes map[string]xr.Type) {
+func (g *CompGlobals) loadProxies(proxies map[string]r.Type, xtypes map[string]xr.Type) {
 	for name, proxy := range proxies {
 		xtype := xtypes[name]
 		if xtype == nil {
@@ -167,12 +347,77 @@ func (g *CompThreadGlobals) loadProxies(proxies map[string]r.Type, xtypes map[st
 	}
 }
 
-// v is an imported variable. build a function that will return it.
-// Do NOT expose its value while compiling, otherwise the fast interpreter
-// will (incorrectly) assume that it's a constant and will perform constant propagation.
+// ======================== use package symbols ===============================
+
+// selectorPlace compiles pkgname.varname returning a settable and/or addressable Place
+func (imp *Import) selectorPlace(c *Comp, name string, opt PlaceOption) *Place {
+	bind, ok := imp.Binds[name]
+	if !ok {
+		c.Errorf("package %v %q has no symbol %s", imp.Name, imp.Path, name)
+	}
+	class := bind.Desc.Class()
+	if bind.Desc.Index() != NoIndex {
+		switch class {
+		case IntBind:
+			return imp.intPlace(c, bind, opt)
+		case VarBind:
+			// optimization: read imp.Vals[] at compile time:
+			// val remains valid even if imp.Vals[] is reallocated
+			val := imp.Vals[bind.Desc.Index()]
+			// a settable reflect.Value is always addressable.
+			// the converse is not guaranteed: unexported fields can be addressed but not set.
+			// see implementation of reflect.Value.CanAddr() and reflect.Value.CanSet() for details
+			if val.IsValid() && val.CanAddr() && val.CanSet() {
+				return &Place{
+					Var: Var{Type: bind.Type},
+					Fun: func(*Env) r.Value {
+						return val
+					},
+					Addr: func(*Env) r.Value {
+						return val.Addr()
+					},
+				}
+			}
+		}
+	}
+	c.Errorf("%v %v %v.%v", opt, class, bind.Type.Kind(), imp.Name, name)
+	return nil
+}
+
+// selector compiles foo.bar where 'foo' is an imported package
+func (imp *Import) selector(c *Comp, name string) *Expr {
+	bind, ok := imp.Binds[name]
+	if !ok {
+		c.Errorf("package %v %q has no symbol %s", imp.Name, imp.Path, name)
+	}
+	switch bind.Desc.Class() {
+	case ConstBind:
+		return exprLit(bind.Lit, bind.AsSymbol(0))
+	case FuncBind, VarBind:
+		return imp.symbol(c, bind)
+	case IntBind:
+		return imp.intSymbol(c, bind)
+	default:
+		c.Errorf("package symbol %s.%s has unknown class %s", imp.Name, name, bind.Desc.Class())
+		return nil
+	}
+}
+
+// create an expression that will return the value of imported variable described by bind.
 //
 // mandatory optimization: for basic kinds, unwrap reflect.Value
-func importedBindAsFun(t xr.Type, v r.Value) I {
+func (imp *Import) symbol(c *Comp, bind *Bind) *Expr {
+	idx := bind.Desc.Index()
+	if idx == NoIndex {
+		c.Errorf("undefined identifier %s._", imp.Name)
+	}
+	// optimization: read imp.Vals[] at compile time:
+	// val remains valid even if imp.Vals[] is reallocated
+	v := imp.Vals[idx]
+	t := bind.Type
+	if !v.IsValid() {
+		return c.exprValue(t, xr.Zero(t).Interface())
+	}
 	var fun I
 	switch t.Kind() {
 	case r.Bool:
@@ -248,5 +493,176 @@ func importedBindAsFun(t xr.Type, v r.Value) I {
 			return v
 		}
 	}
-	return fun
+	// val is an imported variable. do NOT store its value in *Expr,
+	// because that's how constants are represented:
+	// fast interpreter will then (incorrectly) perform constant propagation.
+	return exprFun(t, fun)
+}
+
+// create an expression that will return the value of imported variable described by bind.
+//
+// mandatory optimization: for basic kinds, do not wrap in reflect.Value
+func (imp *Import) intSymbol(c *Comp, bind *Bind) *Expr {
+	t := bind.Type
+	var fun I
+	idx := bind.Desc.Index()
+	if idx == NoIndex {
+		c.Errorf("undefined identifier %s._", imp.Name)
+	}
+	impenv := imp.env
+	switch t.Kind() {
+	case r.Bool:
+		fun = func(env *Env) bool {
+			return *(*bool)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Int:
+		fun = func(env *Env) int {
+			return *(*int)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Int8:
+		fun = func(env *Env) int8 {
+			return *(*int8)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Int16:
+		fun = func(env *Env) int16 {
+			return *(*int16)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Int32:
+		fun = func(env *Env) int32 {
+			return *(*int32)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Int64:
+		fun = func(env *Env) int64 {
+			return *(*int64)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Uint:
+		fun = func(env *Env) uint {
+			return *(*uint)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Uint8:
+		fun = func(env *Env) uint8 {
+			return *(*uint8)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Uint16:
+		fun = func(env *Env) uint16 {
+			return *(*uint16)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Uint32:
+		fun = func(env *Env) uint32 {
+			return *(*uint32)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Uint64:
+		fun = func(env *Env) uint64 {
+			return impenv.Ints[idx]
+		}
+	case r.Uintptr:
+		fun = func(env *Env) uintptr {
+			return *(*uintptr)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Float32:
+		fun = func(env *Env) float32 {
+			return *(*float32)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Float64:
+		fun = func(env *Env) float64 {
+			return *(*float64)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	case r.Complex64:
+		fun = func(env *Env) complex64 {
+			return *(*complex64)(unsafe.Pointer(&impenv.Ints[idx]))
+		}
+	default:
+		c.Errorf("unsupported symbol type, cannot use for optimized read: %v %v.%v <%v>",
+			bind.Desc.Class(), imp.Name, bind.Name, bind.Type)
+		return nil
+	}
+	// Do NOT store impenv.Ints[idx] into *Expr, because that's how constants are represented:
+	// fast interpreter will then (incorrectly) perform constant propagation.
+	return exprFun(t, fun)
+}
+
+// return a Place representing the imported variable described by bind.
+//
+// mandatory optimization: for basic kinds, do not wrap in reflect.Value
+func (imp *Import) intPlace(c *Comp, bind *Bind, opt PlaceOption) *Place {
+	idx := bind.Desc.Index()
+	if idx == NoIndex {
+		c.Errorf("%v %v %v.%v", opt, bind.Desc.Class(), imp.Name, bind.Name)
+	}
+	t := bind.Type
+	var addr func(*Env) r.Value
+	impenv := imp.env
+	switch t.Kind() {
+	case r.Bool:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*bool)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Int:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*int)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Int8:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*int8)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Int16:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*int16)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Int32:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*int32)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Int64:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*int64)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Uint:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*uint)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Uint8:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*uint8)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Uint16:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*uint16)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Uint32:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*uint32)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Uint64:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf(&impenv.Ints[idx])
+		}
+	case r.Uintptr:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*uintptr)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Float32:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*float32)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Float64:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*float64)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	case r.Complex64:
+		addr = func(env *Env) r.Value {
+			return r.ValueOf((*complex64)(unsafe.Pointer(&impenv.Ints[idx])))
+		}
+	default:
+		c.Errorf("%s unsupported variable type <%v>: %s %s.%s",
+			opt, t, bind.Desc.Class(), imp.Name, bind.Name)
+		return nil
+	}
+	return &Place{
+		Var: Var{Type: bind.Type, Name: bind.Name},
+		Fun: func(env *Env) r.Value {
+			return addr(env).Elem()
+		},
+		Addr: addr,
+	}
 }

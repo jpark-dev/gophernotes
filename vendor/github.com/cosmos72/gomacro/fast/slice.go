@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -28,13 +28,11 @@ package fast
 import (
 	"go/ast"
 	r "reflect"
-
-	xr "github.com/cosmos72/gomacro/xreflect"
 )
 
 // SliceExpr compiles slice[lo:hi] and slice[lo:hi:max]
 func (c *Comp) SliceExpr(node *ast.SliceExpr) *Expr {
-	e := c.Expr1(node.X)
+	e := c.Expr1(node.X, nil)
 	if e.Const() {
 		e.ConstTo(e.DefaultType())
 	}
@@ -52,7 +50,7 @@ func (c *Comp) SliceExpr(node *ast.SliceExpr) *Expr {
 	}
 	// constant propagation
 	if e.Const() && (lo == nil || lo.Const()) && (hi == nil || hi.Const()) && (max == nil || max.Const()) {
-		ret.EvalConst(OptKeepUntyped)
+		ret.EvalConst(COptKeepUntyped)
 	}
 	return ret
 }
@@ -61,7 +59,7 @@ func (c *Comp) sliceIndex(node ast.Expr) *Expr {
 	if node == nil {
 		return nil
 	}
-	idx := c.Expr1(node)
+	idx := c.Expr1(node, nil)
 	if idx.Const() {
 		idx.ConstTo(c.TypeOfInt())
 		if idx.Value.(int) < 0 {
@@ -143,7 +141,7 @@ func (c *Comp) slice2(node *ast.SliceExpr, e, lo, hi *Expr) *Expr {
 				}
 			}
 		}
-		tout := xr.SliceOf(t.Elem())
+		tout := c.Universe.SliceOf(t.Elem())
 		return exprX1(tout, fun)
 	}
 	c.Errorf("cannot slice %v: %v", t, node)
@@ -265,7 +263,7 @@ func (c *Comp) slice3(node *ast.SliceExpr, e, lo, hi, max *Expr) *Expr {
 				return obj.Slice3(lo, hi, max)
 			}
 		}
-		tout := xr.SliceOf(t.Elem())
+		tout := c.Universe.SliceOf(t.Elem())
 		return exprX1(tout, fun)
 	}
 	c.Errorf("cannot slice %v: %v", t, node)
@@ -279,6 +277,6 @@ func (c *Comp) sliceArrayMustBeAddressable(node *ast.SliceExpr, e *Expr) {
 			c.Errorf("cannot slice: array must be addressable: %v <%v>", node, e.Type)
 		}
 	}()
-	c.placeOrAddress(node.X, PlaceAddress)
+	c.placeOrAddress(node.X, PlaceAddress, nil)
 	panicking = false
 }

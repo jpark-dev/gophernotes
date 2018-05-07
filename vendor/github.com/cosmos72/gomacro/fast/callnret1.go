@@ -6,7 +6,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -32,14 +32,13 @@ package fast
 
 import (
 	r "reflect"
-	. "github.com/cosmos72/gomacro/base"
 )
 
 func (c *Comp) callnret1(call *Call, maxdepth int) I {
 	expr := call.Fun
 	exprfun := expr.AsX1()
 	if expr.Sym != nil && expr.Sym.Desc.Index() == NoIndex {
-		Errorf("internal error: callnret1() invoked for constant function %#v. use call_builtin() instead", expr)
+		c.Errorf("internal error: callnret1() invoked for constant function %#v. use call_builtin() instead", expr)
 	}
 
 	kret := expr.Type.Out(0).Kind()

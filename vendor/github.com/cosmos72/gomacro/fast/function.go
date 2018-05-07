@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -124,12 +124,12 @@ func (c *Comp) FuncDecl(funcdecl *ast.FuncDecl) {
 		stmt = func(env *Env) (Stmt, *Env) {
 			fun := f(env)
 			// Debugf("setting env.Binds[%d] = %v <%v>", funcindex, fun.Interface(), fun.Type())
-			env.Binds[funcindex] = fun
+			env.Vals[funcindex] = fun
 			env.IP++
 			return env.Code[env.IP], env
 		}
 	}
-	c.Code.Append(stmt, funcdecl.Pos())
+	c.Append(stmt, funcdecl.Pos())
 	panicking = false
 }
 
@@ -148,9 +148,9 @@ func (c *Comp) methodAdd(funcdecl *ast.FuncDecl, t xr.Type) (methodindex int, me
 			c.Errorf("error adding method %s <%v> to type <%v>\n\t%v", name, t, trecv, rec)
 		}
 	}()
-	n1 := trecv.NumMethod()
+	n1 := trecv.NumExplicitMethod()
 	methodindex = trecv.AddMethod(name, t)
-	n2 := trecv.NumMethod()
+	n2 := trecv.NumExplicitMethod()
 	if n1 == n2 {
 		c.Warnf("redefined method: %s.%s", trecv.Name(), name)
 	}
@@ -214,7 +214,7 @@ func (c *Comp) methodDecl(funcdecl *ast.FuncDecl) {
 			return env.Code[env.IP], env
 		}
 	}
-	c.Code.Append(stmt, funcdecl.Pos())
+	c.Append(stmt, funcdecl.Pos())
 }
 
 // FuncLit compiles a function literal, i.e. a closure.
@@ -331,7 +331,6 @@ func (c *Comp) funcMaker(info *FuncInfo, resultfuns []I, funcbody func(*Env)) *f
 
 // actually create the function
 func (c *Comp) funcCreate(t xr.Type, info *FuncInfo, resultfuns []I, funcbody func(*Env)) func(*Env) r.Value {
-	c.ErrorIfCompiled(t)
 
 	m := c.funcMaker(info, resultfuns, funcbody)
 
@@ -402,11 +401,17 @@ func (c *Comp) funcGeneric(t xr.Type, m *funcMaker) func(*Env) r.Value {
 	funcbody := m.funcbody
 	rtype := t.ReflectType()
 
+	var debugC *Comp
+	if c.Globals.Options&base.OptDebugger != 0 {
+		// keep a reference to c only if needed
+		debugC = c
+	}
+
 	return func(env *Env) r.Value {
 		// function is closed over the env used to DECLARE it
 		env.MarkUsedByClosure()
 		return r.MakeFunc(rtype, func(args []r.Value) []r.Value {
-			env := NewEnv4Func(env, nbinds, nintbinds)
+			env := newEnv4Func(env, nbinds, nintbinds, debugC)
 
 			if funcbody != nil {
 				// copy runtime arguments into allocated binds
@@ -449,11 +454,17 @@ func (c *Comp) macroCreate(t xr.Type, info *FuncInfo, resultfuns []I, funcbody f
 	nbinds := m.nbinds
 	nintbinds := m.nintbinds
 
+	var debugC *Comp
+	if c.Globals.Options&base.OptDebugger != 0 {
+		// keep a reference to c only if needed
+		debugC = c
+	}
+
 	return func(env *Env) func(args []r.Value) []r.Value {
 		// macro is closed over the env used to DECLARE it
 		env.MarkUsedByClosure()
 		return func(args []r.Value) []r.Value {
-			env := NewEnv4Func(env, nbinds, nintbinds)
+			env := newEnv4Func(env, nbinds, nintbinds, debugC)
 
 			if funcbody != nil {
 				// copy runtime arguments into allocated binds

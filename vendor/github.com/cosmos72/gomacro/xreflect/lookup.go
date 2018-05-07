@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -87,7 +87,7 @@ func fieldByName(t *xtype, qname QName, offset uintptr, index []int) (field Stru
 	}
 	gtype, ok := t.gtype.Underlying().(*types.Struct)
 	if !ok {
-		debugf("fieldByName: type is %s, not struct. bailing out", t.kind)
+		// debugf("fieldByName: type is %s, not struct. bailing out", t.kind)
 		return
 	}
 	n := t.NumField()
@@ -96,7 +96,7 @@ func fieldByName(t *xtype, qname QName, offset uintptr, index []int) (field Stru
 		gfield := gtype.Field(i)
 		if matchFieldByName(qname, gfield) {
 			if count == 0 {
-				field = t.field(i) // lock already held
+				field = t.field(i) // lock already held. makes a copy
 				field.Offset += offset
 				field.Index = concat(index, field.Index) // make a copy of index
 				// debugf("fieldByName: %d-th field of <%v> matches: %#v", i, t.rtype, field)
@@ -110,7 +110,7 @@ func fieldByName(t *xtype, qname QName, offset uintptr, index []int) (field Stru
 			tovisit = append(tovisit, efield)
 		}
 	}
-	return
+	return field, count, tovisit
 }
 
 // return true if gfield name matches given name, or if it's anonymous and its *type* name matches given name
@@ -154,13 +154,14 @@ func cacheFieldByName(t *xtype, qname QName, field *StructField, count int) {
 	t.universe.fieldcache = true
 }
 
-// anonymousFields returns the anonymous fields of a (named or unnamed) struct type
+// anonymousFields returns the anonymous fields of a struct type (either named or unnamed)
+// also accepts a pointer to a struct type
 func anonymousFields(t *xtype, offset uintptr, index []int) []StructField {
 	var tovisit []StructField
-	gt := t.gtype.Underlying()
-	if gptr, ok := gt.(*types.Pointer); ok {
-		gt = gptr.Elem().Underlying()
+	if t.kind == reflect.Ptr {
+		t = unwrap(t.elem()) // not t.Elem(), it would acquire Universe lock
 	}
+	gt := t.gtype.Underlying()
 	gtype, ok := gt.(*types.Struct)
 	if !ok {
 		return tovisit
@@ -206,7 +207,7 @@ func (t *xtype) MethodByName(name, pkgpath string) (method Method, count int) {
 	method, count = methodByName(t, qname, nil)
 	if count == 0 {
 		tovisit := anonymousFields(t, 0, nil)
-		// breadth-first recursion
+		// breadth-first recursion on struct's anonymous fields
 		for count == 0 && len(tovisit) != 0 {
 			var next []StructField
 			for _, f := range tovisit {
@@ -231,9 +232,11 @@ func (t *xtype) MethodByName(name, pkgpath string) (method Method, count int) {
 	return method, count
 }
 
+// For interfaces, search in *all* methods including wrapper methods for embedded interfaces
+// For all other named types, only search in explicitly declared methods, ignoring wrapper methods for embedded fields.
 func methodByName(t *xtype, qname QName, index []int) (method Method, count int) {
-	// also support embedded fields: they can be named types or pointers to named types
-	if t.kind == reflect.Ptr {
+	// also support embedded fields: they can be interfaces, named types, pointers to named types
+	if t.kind == reflect.Ptr && t.elem().Kind() != reflect.Interface {
 		t = unwrap(t.elem())
 	}
 	n := t.NumMethod()
@@ -243,7 +246,7 @@ func methodByName(t *xtype, qname QName, index []int) (method Method, count int)
 			if count == 0 {
 				method = t.method(i)                                 // lock already held
 				method.FieldIndex = concat(index, method.FieldIndex) // make a copy of index
-				// debugf("methodByName: %d-th method of <%v> matches: %#v", i, t.rtype, method)
+				// debugf("methodByName: %d-th explicit method of <%v> matches: %#v", i, t.rtype, method)
 			}
 			count++
 		}

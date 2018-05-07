@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -35,19 +35,31 @@ import (
 
 // Convert compiles a type conversion expression
 func (c *Comp) Convert(node ast.Expr, t xr.Type) *Expr {
-	e := c.Expr1(node)
+	e := c.Expr1(node, nil)
+
+	return c.convert(e, t, node)
+}
+
+// Convert compiles a type conversion expression
+func (c *Comp) convert(e *Expr, t xr.Type, nodeOpt ast.Expr) *Expr {
 	if e.Untyped() {
-		e.ConstTo(e.DefaultType())
+		e.ConstTo(t)
 	}
 
-	if xr.SameType(e.Type, t) {
+	if e.Type != nil && e.Type.IdenticalTo(t) {
 		return e
+	} else if e.Type != nil && e.Type.ReflectType() == t.ReflectType() {
+		if e.Const() {
+			return c.exprValue(t, e.Value)
+		} else {
+			return exprFun(t, e.Fun)
+		}
 	} else if e.Type == nil && IsNillableKind(t.Kind()) {
 		e.Type = t
 		e.Value = xr.Zero(t).Interface()
 	} else if e.Type != nil && e.Type.ConvertibleTo(t) {
 	} else {
-		c.Errorf("cannot convert %v to %v: %v", e.Type, t, node)
+		c.Errorf("cannot convert %v to %v: %v", e.Type, t, nodeOpt)
 		return nil
 	}
 	rtype := t.ReflectType()
@@ -146,7 +158,7 @@ func (c *Comp) Convert(node ast.Expr, t xr.Type) *Expr {
 	default:
 		if conv := c.Converter(e.Type, t); conv != nil {
 			ret = func(env *Env) r.Value {
-				return conv(fun(env), rtype)
+				return conv(fun(env))
 			}
 		} else {
 			ret = func(env *Env) r.Value {
@@ -154,14 +166,20 @@ func (c *Comp) Convert(node ast.Expr, t xr.Type) *Expr {
 			}
 		}
 	}
-	return exprFun(t, ret)
+	eret := exprFun(t, ret)
+	if e.Const() {
+		eret.EvalConst(COptKeepUntyped)
+	}
+	return eret
 }
 
 // Converter returns a function that converts reflect.Value from tin to tout
 // also supports conversion from interpreted types to interfaces
-func (c *Comp) Converter(tin, tout xr.Type) func(val r.Value, rtout r.Type) r.Value {
+func (c *Comp) Converter(tin, tout xr.Type) func(val r.Value) r.Value {
 	if !tin.ConvertibleTo(tout) {
 		c.Errorf("cannot convert from <%v> to <%v>", tin, tout)
+	} else if tin.IdenticalTo(tout) {
+		return nil
 	}
 	rtin := tin.ReflectType()
 	rtout := tout.ReflectType()
@@ -170,10 +188,28 @@ func (c *Comp) Converter(tin, tout xr.Type) func(val r.Value, rtout r.Type) r.Va
 		return nil
 	case rtin.ConvertibleTo(rtout):
 		// most conversions, including from compiled type to compiled interface
-		return r.Value.Convert
-	case tin.Kind() != r.Interface && rtout.Kind() == r.Interface:
-		// conversion from interpreted type to compiled interface
-		return c.converterToInterface(tin, tout)
+		if rtin.Kind() != r.Interface {
+			return func(obj r.Value) r.Value {
+				return obj.Convert(rtout)
+			}
+		}
+		// extract objects wrapped in proxies (if any)
+		g := c.CompGlobals
+		return func(obj r.Value) r.Value {
+			obj, _ = g.extractFromProxy(obj)
+			if obj.IsValid() {
+				return obj.Convert(rtout)
+			} else {
+				return r.Zero(rtout)
+			}
+		}
+	case xr.IsEmulatedInterface(tout):
+		// conversion from type to emulated interface
+		return c.converterToEmulatedInterface(tin, tout)
+	case rtout.Kind() == r.Interface:
+		// conversion from interpreted type to compiled interface.
+		// must use a proxy that pre-implement compiled interfaces.
+		return c.converterToProxy(tin, tout)
 	default:
 		c.Errorf("unimplemented conversion from <%v> to <%v>", tin, tout)
 		return nil

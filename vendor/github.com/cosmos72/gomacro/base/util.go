@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -26,14 +26,30 @@
 package base
 
 import (
+	"go/build"
+	"os"
 	r "reflect"
+	"strings"
+
+	xr "github.com/cosmos72/gomacro/xreflect"
 )
 
-func PackValues(val0 r.Value, vals []r.Value) []r.Value {
-	if len(vals) == 0 && val0 != None {
-		vals = []r.Value{val0}
+func PackValues(val0 r.Value, values []r.Value) []r.Value {
+	if len(values) == 0 && val0 != None {
+		values = []r.Value{val0}
 	}
-	return vals
+	return values
+}
+
+func PackTypes(typ0 xr.Type, types []xr.Type) []xr.Type {
+	if len(types) == 0 && typ0 != nil {
+		types = []xr.Type{typ0}
+	}
+	return types
+}
+
+func PackValuesAndTypes(val0 r.Value, values []r.Value, typ0 xr.Type, types []xr.Type) ([]r.Value, []xr.Type) {
+	return PackValues(val0, values), PackTypes(typ0, types)
 }
 
 func UnpackValues(vals []r.Value) (r.Value, []r.Value) {
@@ -46,18 +62,18 @@ func UnpackValues(vals []r.Value) (r.Value, []r.Value) {
 
 // ValueInterface() is a zero-value-safe version of reflect.Value.Interface()
 func ValueInterface(v r.Value) interface{} {
-	if v == Nil || v == None || !v.IsValid() || !v.CanInterface() {
+	if !v.IsValid() || !v.CanInterface() || v == None {
 		return nil
 	}
 	return v.Interface()
 }
 
 // ValueType() is a zero-value-safe version of reflect.Value.Type()
-func ValueType(v r.Value) r.Type {
-	if v == Nil || v == None || !v.IsValid() {
+func ValueType(value r.Value) r.Type {
+	if !value.IsValid() || value == None {
 		return nil
 	}
-	return v.Type()
+	return value.Type()
 }
 
 func IsNillableKind(k r.Kind) bool {
@@ -69,3 +85,50 @@ func IsNillableKind(k r.Kind) bool {
 		return false
 	}
 }
+
+// split 's' into a prefix and suffix separated by 'separator'.
+// suffix is trimmed with strings.TrimSpace() before returning it
+func Split2(s string, separator rune) (string, string) {
+	var prefix, suffix string
+	if space := strings.IndexByte(s, ' '); space > 0 {
+		prefix = s[:space]
+		suffix = strings.TrimSpace(s[space+1:])
+	} else {
+		prefix = s
+	}
+	return prefix, suffix
+}
+
+// always use forward slashes. they work also on Windows...
+func unixpath(path string) string {
+	if os.PathSeparator != '/' && len(path) != 0 {
+		path = strings.Replace(path, string(os.PathSeparator), "/", -1)
+	}
+	return path
+}
+
+// find user's home directory, see https://stackoverflow.com/questions/2552416/how-can-i-find-the-users-home-dir-in-a-cross-platform-manner-using-c
+// without importing "os/user" - which requires cgo to work thus makes cross-compile difficult, see https://github.com/golang/go/issues/11797
+func UserHomeDir() string {
+	home := os.Getenv("HOME")
+	if len(home) == 0 {
+		home = os.Getenv("USERPROFILE")
+		if len(home) == 0 {
+			home = os.Getenv("HOMEDRIVE") + os.Getenv("HOMEPATH")
+		}
+	}
+	return unixpath(home)
+}
+
+func Subdir(dirs ...string) string {
+	// should use string(os.PathSeparator) instead of "/', but:
+	// 1) package names use '/', not os.PathSeparator
+	// 2) it would complicate DirName()
+	return strings.Join(dirs, "/")
+}
+
+var (
+	GoSrcDir = Subdir(build.Default.GOPATH, "src")
+
+	GomacroDir = Subdir(GoSrcDir, "github.com", "cosmos72", "gomacro") // vendored copies of gomacro may need to change this
+)

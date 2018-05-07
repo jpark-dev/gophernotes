@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -53,6 +53,9 @@ func (t *xtype) field(i int) StructField {
 	}
 	gtype := t.gtype.Underlying().(*types.Struct)
 
+	if i < 0 || i >= gtype.NumFields() {
+		xerrorf(t, "Field(%v) out of bounds, struct type has %v fields: %v", i, gtype.NumFields(), t)
+	}
 	va := gtype.Field(i)
 	rf := t.rtype.Field(i)
 
@@ -73,7 +76,7 @@ func (t *xtype) NumField() int {
 	if t.kind != reflect.Struct {
 		xerrorf(t, "NumField of non-struct type %v", t)
 	}
-	gtype := t.underlying().(*types.Struct)
+	gtype := t.gunderlying().(*types.Struct)
 	return gtype.NumFields()
 }
 
@@ -147,7 +150,7 @@ func toTags(fields []StructField) []string {
 }
 
 func toExportedFieldName(name string, t Type, anonymous bool) string {
-	if len(name) == 0 && t != nil {
+	if len(name) == 0 && unwrap(t) != nil {
 		if name = t.Name(); len(name) == 0 && t.Kind() == reflect.Ptr {
 			name = t.elem().Name()
 		}
@@ -170,12 +173,4 @@ func (v *Universe) StructOf(fields []StructField) Type {
 		types.NewStruct(vars, tags),
 		reflect.StructOf(rfields),
 	)
-}
-
-func StructOf(fields []StructField) Type {
-	v := universe
-	if len(fields) != 0 && fields[0].Type != nil {
-		v = fields[0].Type.Universe()
-	}
-	return v.StructOf(fields)
 }

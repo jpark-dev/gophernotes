@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -30,48 +30,45 @@ import (
 	"go/token"
 	"go/types"
 	r "reflect"
-	"strings"
 
 	. "github.com/cosmos72/gomacro/ast2"
 	. "github.com/cosmos72/gomacro/base"
 	xr "github.com/cosmos72/gomacro/xreflect"
 )
 
-func NewThreadGlobals() *ThreadGlobals {
-	return &ThreadGlobals{
-		Globals: NewGlobals(),
-	}
-}
-
 func New() *Interp {
-	top := NewCompEnvTop("builtin")
+	top := newTopInterp("builtin")
 	top.env.UsedByClosure = true // do not free this *Env
-	file := NewCompEnv(top, "main")
+	file := NewInnerInterp(top, "main", "main")
 	file.env.UsedByClosure = true // do not free this *Env
 	return file
 }
 
-func NewCompEnvTop(path string) *Interp {
-	name := path[1+strings.LastIndexByte(path, '/'):]
+func newTopInterp(path string) *Interp {
+	name := FileName(path)
 
 	globals := NewGlobals()
 	universe := xr.NewUniverse()
 
-	compGlobals := &CompThreadGlobals{
+	compGlobals := &CompGlobals{
+		Globals:      globals,
 		Universe:     universe,
+		KnownImports: make(map[string]*Import),
 		interf2proxy: make(map[r.Type]r.Type),
 		proxy2interf: make(map[r.Type]xr.Type),
-		Globals:      globals,
+		Prompt:       "gomacro> ",
 	}
 	envGlobals := &ThreadGlobals{Globals: globals}
 	ce := &Interp{
 		Comp: &Comp{
-			UpCost:            1,
-			Depth:             0,
-			Outer:             nil,
-			Name:              name,
-			Path:              path,
-			CompThreadGlobals: compGlobals,
+			CompGlobals: compGlobals,
+			CompBinds: CompBinds{
+				Name: name,
+				Path: path,
+			},
+			UpCost: 1,
+			Depth:  0,
+			Outer:  nil,
 		},
 		env: &Env{
 			Outer:         nil,
@@ -79,43 +76,48 @@ func NewCompEnvTop(path string) *Interp {
 		},
 	}
 	// tell xreflect about our packages "fast" and "main"
-	compGlobals.Universe.CachePackage(types.NewPackage("fast", "fast"))
-	compGlobals.Universe.CachePackage(types.NewPackage("main", "main"))
+	universe.CachePackage(types.NewPackage("fast", "fast"))
+	universe.CachePackage(types.NewPackage("main", "main"))
 
-	// no need to scavenge for Builtin, Function, Import, Macro and UntypedLit fields and methods.
+	// no need to scavenge for Builtin, Function,  Macro and UntypedLit fields and methods.
 	// actually, making them opaque helps securing against malicious interpreted code.
-	for _, rtype := range []r.Type{rtypeOfBuiltin, rtypeOfFunction, rtypeOfImport, rtypeOfMacro, rtypeOfUntypedLit} {
-		compGlobals.opaqueType(rtype)
+	for _, rtype := range []r.Type{rtypeOfBuiltin, rtypeOfFunction, rtypeOfPtrImport, rtypeOfMacro} {
+		compGlobals.opaqueType(rtype, "fast")
 	}
+	compGlobals.opaqueType(rtypeOfUntypedLit, "untyped")
 
 	envGlobals.TopEnv = ce.env
 	ce.addBuiltins()
 	return ce
 }
 
-func NewCompEnv(outer *Interp, path string) *Interp {
-	name := path[1+strings.LastIndexByte(path, '/'):]
+func NewInnerInterp(outer *Interp, name string, path string) *Interp {
+	if len(name) == 0 {
+		name = FileName(path)
+	}
 
-	compGlobals := outer.Comp.CompThreadGlobals
-	envGlobals := outer.env.ThreadGlobals
-	c := &Interp{
+	outerComp := outer.Comp
+	outerEnv := outer.env
+	ir := &Interp{
 		Comp: &Comp{
-			UpCost:            1,
-			Depth:             outer.Comp.Depth + 1,
-			Outer:             outer.Comp,
-			Name:              name,
-			Path:              path,
-			CompThreadGlobals: compGlobals,
+			CompGlobals: outerComp.CompGlobals,
+			CompBinds: CompBinds{
+				Name: name,
+				Path: path,
+			},
+			UpCost: 1,
+			Depth:  outerComp.Depth + 1,
+			Outer:  outerComp,
 		},
 		env: &Env{
-			Outer:         outer.env,
-			ThreadGlobals: envGlobals,
+			Outer:         outerEnv,
+			ThreadGlobals: outerEnv.ThreadGlobals,
 		},
 	}
-	if outer.env.Outer == nil {
-		envGlobals.FileEnv = c.env
+	if outerEnv.Outer == nil {
+		outerEnv.ThreadGlobals.FileEnv = ir.env
 	}
-	return c
+	return ir
 }
 
 func NewComp(outer *Comp, code *Code) *Comp {
@@ -123,11 +125,10 @@ func NewComp(outer *Comp, code *Code) *Comp {
 		return &Comp{UpCost: 1}
 	}
 	c := Comp{
-		UpCost:            1,
-		Depth:             outer.Depth + 1,
-		Outer:             outer,
-		CompileOptions:    outer.CompileOptions,
-		CompThreadGlobals: outer.CompThreadGlobals,
+		UpCost:      1,
+		Depth:       outer.Depth + 1,
+		Outer:       outer,
+		CompGlobals: outer.CompGlobals,
 	}
 	// Debugf("NewComp(%p->%p) %s", outer, &c, debug.Stack())
 	if code != nil {
@@ -160,67 +161,71 @@ var ignoredBinds = []r.Value{Nil}
 var ignoredIntBinds = []uint64{0}
 
 func NewEnv(outer *Env, nbinds int, nintbinds int) *Env {
-	tg := outer.ThreadGlobals
-	pool := &tg.Pool // pool is an array, do NOT copy it!
-	index := tg.PoolSize - 1
+	g := outer.ThreadGlobals
+	pool := &g.Pool // pool is an array, do NOT copy it!
+	index := g.PoolSize - 1
 	var env *Env
 	if index >= 0 {
-		tg.PoolSize = index
+		g.PoolSize = index
 		env = pool[index]
 		pool[index] = nil
 	} else {
 		env = &Env{}
 	}
 	if nbinds <= 1 {
-		env.Binds = ignoredBinds
-	} else if cap(env.Binds) < nbinds {
-		env.Binds = make([]r.Value, nbinds)
+		env.Vals = ignoredBinds
+	} else if cap(env.Vals) < nbinds {
+		env.Vals = make([]r.Value, nbinds)
 	} else {
-		env.Binds = env.Binds[0:nbinds]
+		env.Vals = env.Vals[0:nbinds]
 	}
 	if nintbinds <= 1 {
-		env.IntBinds = ignoredIntBinds
-	} else if cap(env.IntBinds) < nintbinds {
-		env.IntBinds = make([]uint64, nintbinds)
+		env.Ints = ignoredIntBinds
+	} else if cap(env.Ints) < nintbinds {
+		env.Ints = make([]uint64, nintbinds)
 	} else {
-		env.IntBinds = env.IntBinds[0:nintbinds]
+		env.Ints = env.Ints[0:nintbinds]
 	}
 	env.Outer = outer
 	env.IP = outer.IP
 	env.Code = outer.Code
-	env.ThreadGlobals = tg
+	env.ThreadGlobals = g
+	env.DebugPos = outer.DebugPos
+	env.CallDepth = g.CallDepth
 	return env
 }
 
-func NewEnv4Func(outer *Env, nbinds int, nintbinds int) *Env {
-	tg := outer.ThreadGlobals
-	pool := &tg.Pool // pool is an array, do NOT copy it!
-	index := tg.PoolSize - 1
+func newEnv4Func(outer *Env, nbinds int, nintbinds int, debugComp *Comp) *Env {
+	g := outer.ThreadGlobals
+	pool := &g.Pool // pool is an array, do NOT copy it!
+	index := g.PoolSize - 1
 	var env *Env
 	if index >= 0 {
-		tg.PoolSize = index
+		g.PoolSize = index
 		env = pool[index]
 		pool[index] = nil
 	} else {
 		env = &Env{}
 	}
 	if nbinds <= 1 {
-		env.Binds = ignoredBinds
-	} else if cap(env.Binds) < nbinds {
-		env.Binds = make([]r.Value, nbinds)
+		env.Vals = ignoredBinds
+	} else if cap(env.Vals) < nbinds {
+		env.Vals = make([]r.Value, nbinds)
 	} else {
-		env.Binds = env.Binds[0:nbinds]
+		env.Vals = env.Vals[0:nbinds]
 	}
 	if nintbinds <= 1 {
-		env.IntBinds = ignoredIntBinds
-	} else if cap(env.IntBinds) < nintbinds {
-		env.IntBinds = make([]uint64, nintbinds)
+		env.Ints = ignoredIntBinds
+	} else if cap(env.Ints) < nintbinds {
+		env.Ints = make([]uint64, nintbinds)
 	} else {
-		env.IntBinds = env.IntBinds[0:nintbinds]
+		env.Ints = env.Ints[0:nintbinds]
 	}
 	env.Outer = outer
-	env.ThreadGlobals = tg
-	// Debugf("NewEnv4Func(%p->%p) binds=%d intbinds=%d", outer, env, nbinds, nintbinds)
+	env.ThreadGlobals = g
+	env.DebugComp = debugComp
+	env.CallDepth = g.CallDepth + 1
+	// Debugf("newEnv4Func(%p->%p) binds=%d intbinds=%d", outer, env, nbinds, nintbinds)
 	return env
 }
 
@@ -242,25 +247,17 @@ func (env *Env) FreeEnv() {
 	if n >= PoolCapacity {
 		return
 	}
-	if env.AddressTaken {
-		env.IntBinds = nil
-		env.AddressTaken = false
+	if env.IntAddressTaken {
+		env.Ints = nil
+		env.IntAddressTaken = false
 	}
 	env.Outer = nil
 	env.Code = nil
+	env.DebugPos = nil
+	env.DebugComp = nil
 	env.ThreadGlobals = nil
 	common.Pool[n] = env // pool is an array, be careful NOT to copy it!
 	common.PoolSize = n + 1
-}
-
-func (c *Comp) IsCompiled() bool {
-	return c.CompileOptions.IsCompiled()
-}
-
-func (c *Comp) ErrorIfCompiled(x interface{}) {
-	if c.IsCompiled() {
-		c.Errorf("internal error: compiler for %v has flag OptIsCompiled set. this should not happen!", x)
-	}
 }
 
 func (env *Env) Top() *Env {
@@ -286,7 +283,7 @@ func (env *Env) File() *Env {
 func (c *Comp) Parse(src string) Ast {
 	c.Line = 0
 	nodes := c.ParseBytes([]byte(src))
-	forms := AnyToAst(nodes, "Parse")
+	forms := anyToAst(nodes, "Parse")
 
 	forms, _ = c.MacroExpandCodewalk(forms)
 	if c.Options&OptShowMacroExpand != 0 {
@@ -310,9 +307,9 @@ func (c *Comp) Compile(in Ast) *Expr {
 				list = append(list, e)
 			}
 		}
-		return exprList(list, c.CompileOptions)
+		return exprList(list, c.CompileOptions())
 	}
-	c.Errorf("Compile: unsupported value, expecting <AstWithNode> or <AstWithSlice>, found %v <%v>", in, r.TypeOf(in))
+	c.Errorf("unsupported Ast node, expecting <AstWithNode> or <AstWithSlice>, found %v <%v>", in, r.TypeOf(in))
 	return nil
 }
 
@@ -339,16 +336,16 @@ func (c *Comp) CompileNode(node ast.Node) *Expr {
 	case ast.Decl:
 		c.Decl(node)
 	case ast.Expr:
-		return c.Expr(node)
+		return c.Expr(node, nil)
 	case *ast.ExprStmt:
 		// special case of statement
-		return c.Expr(node.X)
+		return c.Expr(node.X, nil)
 	case ast.Stmt:
 		c.Stmt(node)
 	case *ast.File:
 		c.File(node)
 	default:
-		c.Errorf("Compile: unsupported expression, expecting <ast.Decl>, <ast.Expr>, <ast.Stmt> or <*ast.File>, found %v <%v>", node, r.TypeOf(node))
+		c.Errorf("unsupported node type, expecting <ast.Decl>, <ast.Expr>, <ast.Stmt> or <*ast.File>, found %v <%v>", node, r.TypeOf(node))
 		return nil
 	}
 	return c.Code.AsExpr()

@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -80,14 +80,14 @@ func (c *Comp) CallExpr(node *ast.CallExpr) *Expr {
 // callExpr compiles the common part between CallExpr and Go statement
 func (c *Comp) prepareCall(node *ast.CallExpr, fun *Expr) *Call {
 	if fun == nil {
-		fun = c.Expr1(node.Fun)
+		fun = c.Expr1(node.Fun, nil)
 	}
 	t := fun.Type
 	var builtin bool
 	var lastarg *Expr
-	if xr.SameType(t, c.TypeOfBuiltin()) {
+	if t.IdenticalTo(c.TypeOfBuiltin()) {
 		return c.callBuiltin(node, fun)
-	} else if xr.SameType(t, c.TypeOfFunction()) {
+	} else if t.IdenticalTo(c.TypeOfFunction()) {
 		fun, lastarg = c.callFunction(node, fun)
 		t = fun.Type
 		builtin = true
@@ -99,7 +99,7 @@ func (c *Comp) prepareCall(node *ast.CallExpr, fun *Expr) *Call {
 	var args []*Expr
 	if len(node.Args) == 1 {
 		// support foo(bar()) where bar() returns multiple values
-		arg := c.Expr(node.Args[0])
+		arg := c.Expr(node.Args[0], nil)
 		if arg.NumOut() == 0 {
 			c.Errorf("function argument returns zero values: %v ", node.Args[0])
 		}
@@ -154,7 +154,7 @@ func (c *Comp) call_any(call *Call) *Expr {
 	}
 	// constant propagation - only if function returns a single value
 	if call.Const && len(call.OutTypes) == 1 {
-		expr.EvalConst(OptDefaults)
+		expr.EvalConst(COptDefaults)
 		// c.Debugf("pre-computed result of constant call %v: %v <%v>", call, expr.Value, TypeOf(expr.Value))
 	}
 	return expr
@@ -187,13 +187,11 @@ func (c *Comp) checkCallArgs(node *ast.CallExpr, t xr.Type, args []*Expr, ellips
 	if variadic {
 		tlast = t.In(n - 1).Elem()
 	}
-	var convs []func(r.Value, r.Type) r.Value
-	var rtypes []r.Type
+	var convs []func(r.Value) r.Value
 	needconvs := false
 	multivalue := len(args) != narg
 	if multivalue {
-		convs = make([]func(r.Value, r.Type) r.Value, narg)
-		rtypes = make([]r.Type, narg)
+		convs = make([]func(r.Value) r.Value, narg)
 	}
 	for i := 0; i < narg; i++ {
 		if variadic && i >= n-1 {
@@ -208,7 +206,6 @@ func (c *Comp) checkCallArgs(node *ast.CallExpr, t xr.Type, args []*Expr, ellips
 				c.Errorf("cannot use <%v> as <%v> in argument to %v", targ, ti, node.Fun)
 			} else if conv := c.Converter(targ, ti); conv != nil {
 				convs[i] = conv
-				rtypes[i] = ti.ReflectType()
 				args[0].Types[i] = ti
 				needconvs = true
 			}
@@ -227,12 +224,12 @@ func (c *Comp) checkCallArgs(node *ast.CallExpr, t xr.Type, args []*Expr, ellips
 	if !multivalue || !needconvs {
 		return
 	}
-	f := args[0].AsXV(OptDefaults)
+	f := args[0].AsXV(COptDefaults)
 	args[0].Fun = func(env *Env) (r.Value, []r.Value) {
 		_, vs := f(env)
 		for i, conv := range convs {
 			if conv != nil {
-				vs[i] = conv(vs[i], rtypes[i])
+				vs[i] = conv(vs[i])
 			}
 		}
 		return vs[0], vs

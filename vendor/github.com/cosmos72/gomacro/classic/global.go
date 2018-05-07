@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -72,12 +72,3 @@ type TypedValue struct {
  * }
  */
 type Methods map[string]TypedValue
-
-/**
- * Interface is the interpreted version of Golang interface values.
- * Each Interface contains {
- *   Type:  the interface type. returned by Env.evalInterface(), i.e. the type of a struct {  interface{}; functions... }
- *   Value: the datum implementing the interface. Value.Type() must be its concrete type, i.e. == r.TypeOf(Value.Interface())
- * }
- */
-type Interface TypedValue

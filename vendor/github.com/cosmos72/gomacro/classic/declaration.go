@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -52,7 +52,7 @@ func (env *Env) evalDeclGen(node *ast.GenDecl) (r.Value, []r.Value) {
 	switch tok {
 	case token.IMPORT:
 		for _, decl := range node.Specs {
-			ret, rets = env.evalImport(decl)
+			ret, rets = env.evalImportDecl(decl)
 		}
 	case token.CONST:
 		var defaultType ast.Expr
@@ -99,9 +99,9 @@ func (env *Env) evalDeclType(node ast.Spec) (r.Value, []r.Value) {
 	switch node := node.(type) {
 	case *ast.TypeSpec:
 		name := node.Name.Name
-		// PATCH: support type aliases
-		if unary, ok := node.Type.(*ast.UnaryExpr); ok && unary.Op == token.ASSIGN {
-			t := env.evalTypeAlias(name, unary.X)
+		// support type aliases
+		if node.Assign != token.NoPos {
+			t := env.evalTypeAlias(name, node.Type)
 			return r.ValueOf(&t).Elem(), nil // return a reflect.Type, not the concrete type
 		}
 

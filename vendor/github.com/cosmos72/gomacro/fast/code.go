@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -17,7 +17,7 @@
  *     along with this program.  If not, see <https://www.gnu.org/licenses/lgpl>.
  *
  *
- * code.go
+ * exec.go
  *
  *  Created on Apr 09, 2017
  *      Author Massimiliano Ghilardi
@@ -27,7 +27,8 @@ package fast
 
 import (
 	"go/token"
-	"unsafe"
+
+	. "github.com/cosmos72/gomacro/base"
 )
 
 func (code *Code) Clear() {
@@ -38,6 +39,15 @@ func (code *Code) Clear() {
 
 func (code *Code) Len() int {
 	return len(code.List)
+}
+
+func (code *Code) Truncate(n int) {
+	if len(code.List) > n {
+		code.List = code.List[0:n]
+	}
+	if len(code.DebugPos) > n {
+		code.DebugPos = code.DebugPos[0:n]
+	}
 }
 
 func (code *Code) Append(stmt Stmt, pos token.Pos) {
@@ -55,9 +65,19 @@ func (code *Code) AsExpr() *Expr {
 	return expr0(fun)
 }
 
-// declare a var instead of function: Code.Exec() needs the address of Interrupt
-var Interrupt Stmt = func(env *Env) (Stmt, *Env) {
-	return env.ThreadGlobals.Interrupt, env
+// spinInterrupt is the statement executed while waiting for an interrupt to be serviced.
+// To signal an interrupt, a statement must set env.ThreadGlobals.Signal to the desired signal,
+// then return env.ThreadGlobals.Interrupt, env
+func spinInterrupt(env *Env) (Stmt, *Env) {
+	g := env.ThreadGlobals
+	if g.Signals.Sync == SigNone {
+		g.Signals.Sync = SigReturn
+	}
+	if g.Signals.Async == SigInterrupt {
+		g.Signals.Async = SigNone
+		panic(SigInterrupt)
+	}
+	return g.Interrupt, env
 }
 
 func pushDefer(g *ThreadGlobals, deferOf *Env, panicking bool) (retg *ThreadGlobals, deferOf_ *Env, isDefer bool) {
@@ -66,20 +86,25 @@ func pushDefer(g *ThreadGlobals, deferOf *Env, panicking bool) (retg *ThreadGlob
 		g.PanicFun = deferOf
 	}
 	g.DeferOfFun = deferOf
-	g.StartDefer = true
-	return g, deferOf_, g.IsDefer
+	g.ExecFlags.SetStartDefer(true)
+	return g, deferOf_, g.ExecFlags.IsDefer()
 }
 
 func popDefer(g *ThreadGlobals, deferOf *Env, isDefer bool) {
 	g.DeferOfFun = deferOf
-	g.StartDefer = false
-	g.IsDefer = isDefer
+	g.ExecFlags.SetStartDefer(false)
+	g.ExecFlags.SetDefer(isDefer)
 }
 
-func restore(g *ThreadGlobals, flag bool, interrupt Stmt) {
-	g.IsDefer = flag
-	g.Signal = SigNone
+func restore(g *ThreadGlobals, isDefer bool, interrupt Stmt, callDepth int) {
+	g.ExecFlags.SetDefer(isDefer)
+	g.CallDepth = callDepth
 	g.Interrupt = interrupt
+	g.Signals.Sync = SigNone
+	if g.Signals.Async == SigInterrupt {
+		g.Signals.Async = SigNone
+		panic(SigInterrupt)
+	}
 }
 
 func maybeRepanic(g *ThreadGlobals) bool {
@@ -88,6 +113,10 @@ func maybeRepanic(g *ThreadGlobals) bool {
 	}
 	// either not panicking or recover() invoked, no longer panicking
 	return false
+}
+
+func (g *ThreadGlobals) interrupt() {
+	g.Signals.Async = SigInterrupt
 }
 
 // Exec returns a func(*Env) that will execute the compiled code
@@ -100,35 +129,38 @@ func (code *Code) Exec() func(*Env) {
 	if len(all) == 0 {
 		return nil
 	}
-	all = append(all, Interrupt)
+	all = append(all, spinInterrupt)
 
 	if defers {
 		// code to support defer is slower... isolate it in a separate function
-		return func(env *Env) {
-			execWithDefers(env, all, pos)
-		}
-	} else {
-		return exec(all, pos)
+		return execWithFlags(all, pos)
 	}
+	return exec(all, pos)
 }
 
 func exec(all []Stmt, pos []token.Pos) func(*Env) {
 	return func(env *Env) {
 		g := env.ThreadGlobals
-		if g.IsDefer || g.StartDefer {
-			// code to support defer is slower... isolate it in a separate function
-			execWithDefers(env, all, pos)
+		g.Signals.Sync = SigNone
+		if g.ExecFlags != 0 {
+			// code to support defer and debugger is slower... isolate it in a separate function
+			reExecWithFlags(env, all, pos, all[0], 0)
 			return
 		}
+		if g.Signals.Async == SigInterrupt {
+			g.Signals.Async = SigNone
+			panic(SigInterrupt)
+		}
+		saveInterrupt := g.Interrupt
+		g.Interrupt = nil
+
 		stmt := all[0]
 		env.IP = 0
 		env.Code = all
 		env.DebugPos = pos
 
-		interrupt := g.Interrupt
-		g.Interrupt = nil
-		var unsafeInterrupt *uintptr
-		g.Signal = SigNone
+		saveDepth := g.CallDepth
+		g.CallDepth = env.CallDepth
 
 		for j := 0; j < 5; j++ {
 			if stmt, env = stmt(env); stmt != nil {
@@ -145,7 +177,9 @@ func exec(all []Stmt, pos []token.Pos) func(*Env) {
 														if stmt, env = stmt(env); stmt != nil {
 															if stmt, env = stmt(env); stmt != nil {
 																if stmt, env = stmt(env); stmt != nil {
-																	continue
+																	if g.Signals.IsEmpty() {
+																		continue
+																	}
 																}
 															}
 														}
@@ -163,8 +197,7 @@ func exec(all []Stmt, pos []token.Pos) func(*Env) {
 			goto finish
 		}
 
-		unsafeInterrupt = *(**uintptr)(unsafe.Pointer(&Interrupt))
-		env.ThreadGlobals.Interrupt = Interrupt
+		g.Interrupt = spinInterrupt
 		for {
 			stmt, env = stmt(env)
 			stmt, env = stmt(env)
@@ -182,38 +215,61 @@ func exec(all []Stmt, pos []token.Pos) func(*Env) {
 			stmt, env = stmt(env)
 			stmt, env = stmt(env)
 
-			if *(**uintptr)(unsafe.Pointer(&stmt)) == unsafeInterrupt {
+			if !g.Signals.IsEmpty() {
 				break
 			}
 		}
 	finish:
 		// restore env.ThreadGlobals.Interrupt and Signal before returning
-		g.Interrupt = interrupt
-		g.Signal = SigNone
+		g.Interrupt = saveInterrupt
+		if g.Signals.Async == SigInterrupt {
+			g.Signals.Async = SigNone
+			g.CallDepth = saveDepth
+			panic(SigInterrupt)
+		}
+		if g.Signals.Debug != SigNone {
+			reExecWithFlags(env, all, pos, stmt, env.IP)
+			return
+		}
+		g.Signals.Sync = SigNone
+		g.CallDepth = saveDepth
 		return
 	}
 }
 
-// execWithDefers executes the given compiled code, including support for defer()
-func execWithDefers(env *Env, all []Stmt, pos []token.Pos) {
+// execWithFlags returns a function that will execute the given compiled code, including support for defer() and debugger
+func execWithFlags(all []Stmt, pos []token.Pos) func(*Env) {
+	return func(env *Env) {
+		env.ThreadGlobals.Signals.Sync = SigNone
+		reExecWithFlags(env, all, pos, all[0], 0)
+	}
+}
+
+func reExecWithFlags(env *Env, all []Stmt, pos []token.Pos, stmt Stmt, ip int) {
+	g := env.ThreadGlobals
+
+	ef := &g.ExecFlags
+	trace := g.Options&OptDebugDebugger != 0
+	if trace {
+		g.Debugf("reExecWithFlags:  executing function   stmt = %p, env = %p, IP = %v, execFlags = %v, signals = %#v", stmt, env, ip, *ef, g.Signals)
+	}
+	if g.Signals.Async == SigInterrupt {
+		g.Signals.Async = SigNone
+		panic(SigInterrupt)
+	}
+	// restore g.IsDefer, g.Signal, g.DebugCallDepth and g.Interrupt on return
+	defer restore(g, g.ExecFlags.IsDefer(), g.Interrupt, g.CallDepth)
+	ef.SetDefer(ef.StartDefer())
+	ef.SetStartDefer(false)
+	ef.SetDebug(g.Signals.Debug != SigNone)
+
 	funenv := env
-	stmt := all[0]
-	env.IP = 0
+	env.IP = ip
 	env.Code = all
 	env.DebugPos = pos
+	g.CallDepth = env.CallDepth
 
-	g := env.ThreadGlobals
-	interrupt := g.Interrupt
-	g.Interrupt = nil
-	var unsafeInterrupt *uintptr
-
-	defer restore(g, g.IsDefer, interrupt) // restore g.IsDefer, g.Signal and g.Interrupt on return
-	g.Signal = SigNone
-	g.IsDefer = g.StartDefer
-	g.StartDefer = false
-	panicking := true
-	panicking2 := false
-
+	panicking, panicking2 := true, false
 	rundefer := func(fun func()) {
 		if panicking || panicking2 {
 			panicking = true
@@ -229,6 +285,11 @@ func execWithDefers(env *Env, all []Stmt, pos []token.Pos) {
 		}
 	}
 
+	if stmt == nil || !g.Signals.IsEmpty() {
+		goto signal
+	}
+again:
+	g.Interrupt = nil
 	for j := 0; j < 5; j++ {
 		if stmt, env = stmt(env); stmt != nil {
 			if stmt, env = stmt(env); stmt != nil {
@@ -244,7 +305,9 @@ func execWithDefers(env *Env, all []Stmt, pos []token.Pos) {
 													if stmt, env = stmt(env); stmt != nil {
 														if stmt, env = stmt(env); stmt != nil {
 															if stmt, env = stmt(env); stmt != nil {
-																continue
+																if g.Signals.IsEmpty() {
+																	continue
+																}
 															}
 														}
 													}
@@ -259,22 +322,23 @@ func execWithDefers(env *Env, all []Stmt, pos []token.Pos) {
 				}
 			}
 		}
-		if g.Signal != SigDefer {
-			goto finish
+		for g.Signals.Sync == SigDefer {
+			g.Signals.Sync = SigNone
+			fun := g.InstallDefer
+			g.InstallDefer = nil
+			defer rundefer(fun)
+			stmt = env.Code[env.IP]
+			if stmt == nil {
+				goto signal
+			}
 		}
-		fun := g.InstallDefer
-		g.Signal = SigNone
-		g.InstallDefer = nil
-		defer rundefer(fun)
-		stmt = env.Code[env.IP]
-		if stmt != nil {
-			continue
+		if !g.Signals.IsEmpty() {
+			goto signal
 		}
-		break
+		continue
 	}
 
-	unsafeInterrupt = *(**uintptr)(unsafe.Pointer(&Interrupt))
-	env.ThreadGlobals.Interrupt = Interrupt
+	g.Interrupt = spinInterrupt
 	for {
 		stmt, env = stmt(env)
 		stmt, env = stmt(env)
@@ -292,22 +356,36 @@ func execWithDefers(env *Env, all []Stmt, pos []token.Pos) {
 		stmt, env = stmt(env)
 		stmt, env = stmt(env)
 
-		if *(**uintptr)(unsafe.Pointer(&stmt)) == unsafeInterrupt {
-			if g.Signal != SigDefer {
-				goto finish
-			}
+		for g.Signals.Sync == SigDefer {
+			g.Signals.Sync = SigNone
 			fun := g.InstallDefer
-			g.Signal = SigNone
 			g.InstallDefer = nil
 			defer rundefer(fun)
+			// single step
 			stmt = env.Code[env.IP]
-			if *(**uintptr)(unsafe.Pointer(&stmt)) != unsafeInterrupt {
-				continue
-			}
-			break
+			stmt, env = stmt(env)
+		}
+		if !g.Signals.IsEmpty() {
+			goto signal
 		}
 	}
-finish:
+signal:
+	for g.Signals.Debug != SigNone {
+		g.Interrupt = spinInterrupt
+		stmt, env = singleStep(env)
+		if trace {
+			g.Debugf("singleStep returned stmt = %p, env = %p, IP = %v, execFlags = %v, signals = %#v", stmt, env, env.IP, g.ExecFlags, g.Signals)
+		}
+		// a Sync or Async signal may be pending.
+		if g.Signals.Sync == SigReturn || g.Signals.Async != SigNone {
+			break
+		}
+		if g.Signals.IsEmpty() || g.Signals.Sync == SigDefer {
+			goto again
+		}
+	}
 	panicking = false
+	// no need to restore g.IsDefer, g.Signal, g.Interrupt:
+	// done by defer restore(g, g.IsDefer, interrupt) above
 	return
 }

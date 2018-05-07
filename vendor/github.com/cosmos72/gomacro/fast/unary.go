@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -53,7 +53,7 @@ func (c *Comp) UnaryExpr(node *ast.UnaryExpr) *Expr {
 		return c.AddressOf(node)
 	}
 
-	xe := c.Expr1(node.X)
+	xe := c.Expr1(node.X, nil)
 	if xe.Type == nil {
 		return c.invalidUnaryExpr(node, xe)
 	}
@@ -83,7 +83,7 @@ func (c *Comp) UnaryExpr(node *ast.UnaryExpr) *Expr {
 	}
 	if isConst {
 		// constant propagation
-		z.EvalConst(OptKeepUntyped)
+		z.EvalConst(COptKeepUntyped)
 	}
 	return z
 }
@@ -93,7 +93,7 @@ func (c *Comp) UnaryExprUntyped(node *ast.UnaryExpr, xe *Expr) *Expr {
 	switch op {
 	case token.ADD, token.SUB, token.XOR, token.NOT:
 		xlit := xe.Value.(UntypedLit)
-		ret := constant.UnaryOp(op, xlit.Obj, 0)
+		ret := constant.UnaryOp(op, xlit.Val, 0)
 		if ret == constant.MakeUnknown() {
 			return c.invalidUnaryExpr(node, xe)
 		}

@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -48,6 +48,18 @@ func UnescapeString(str string) string {
 		Error(err)
 	}
 	return ret
+}
+
+func MaybeUnescapeString(str string) string {
+	n := len(str)
+	if n >= 2 && (str[0] == '"' || str[0] == '`' || str[0] == '\'') && str[n-1] == str[0] {
+		ret, err := strconv.Unquote(str)
+		if err != nil {
+			Error(err)
+		}
+		return ret
+	}
+	return str
 }
 
 func FindFirstToken(src []byte) int {

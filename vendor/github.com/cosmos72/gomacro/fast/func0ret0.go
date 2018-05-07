@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -28,6 +28,7 @@ package fast
 import (
 	r "reflect"
 
+	. "github.com/cosmos72/gomacro/base"
 	xr "github.com/cosmos72/gomacro/xreflect"
 )
 
@@ -38,6 +39,10 @@ func (c *Comp) func0ret0(t xr.Type, m *funcMaker) func(env *Env) r.Value {
 			return valueOfNopFunc
 		}
 	}
+	var debugC *Comp
+	if c.Globals.Options&OptDebugger != 0 {
+		debugC = c
+	}
 
 	nbinds := m.nbinds
 	nintbinds := m.nintbinds
@@ -45,7 +50,7 @@ func (c *Comp) func0ret0(t xr.Type, m *funcMaker) func(env *Env) r.Value {
 		// function is closed over the env used to DECLARE it
 		env.MarkUsedByClosure()
 		return r.ValueOf(func() {
-			env := NewEnv4Func(env, nbinds, nintbinds)
+			env := newEnv4Func(env, nbinds, nintbinds, debugC)
 			// execute the body
 			funcbody(env)
 

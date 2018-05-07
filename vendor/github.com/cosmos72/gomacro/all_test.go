@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -28,6 +28,7 @@ package main
 import (
 	"go/ast"
 	"go/token"
+	"math/big"
 	r "reflect"
 	"testing"
 	"time"
@@ -36,16 +37,18 @@ import (
 	. "github.com/cosmos72/gomacro/base"
 	"github.com/cosmos72/gomacro/classic"
 	"github.com/cosmos72/gomacro/fast"
+	mp "github.com/cosmos72/gomacro/parser"
+	mt "github.com/cosmos72/gomacro/token"
 	xr "github.com/cosmos72/gomacro/xreflect"
 )
 
 type TestFor int
 
 const (
-	I TestFor = 1 << iota
-	F
-	S // set option OptDebugSleepOnSwitch
-	A = I | F
+	S TestFor = 1 << iota // set option OptDebugSleepOnSwitch
+	C                     // test for classic interpreter
+	F                     // test for fast interpreter
+	A = C | F             // test for both interpreters
 )
 
 type TestCase struct {
@@ -60,7 +63,7 @@ func TestClassic(t *testing.T) {
 	ir := classic.New()
 	// ir.Options |= OptDebugCallStack | OptDebugPanicRecover
 	for _, test := range testcases {
-		if test.testfor&I != 0 {
+		if test.testfor&C != 0 {
 			test := test
 			t.Run(test.name, func(t *testing.T) { test.classic(t, ir) })
 		}
@@ -77,22 +80,50 @@ func TestFast(t *testing.T) {
 	}
 }
 
+type shouldpanic struct{}
+
+func (shouldpanic) String() string {
+	return "shouldpanic"
+}
+
+// a value that the interpreter cannot produce.
+// only matches if the interpreter panicked
+var panics shouldpanic
+
 func (test *TestCase) classic(t *testing.T, ir *classic.Interp) {
-
-	rets := PackValues(ir.Eval(test.program))
-
+	var rets []r.Value
+	panicking := true
+	if test.result0 == panics {
+		defer func() {
+			if panicking {
+				recover()
+			}
+		}()
+	}
+	rets = PackValues(ir.Eval(test.program))
+	panicking = false
 	test.compareResults(t, rets)
 }
 
 func (test *TestCase) fast(t *testing.T, ir *fast.Interp) {
-
 	if test.testfor&S != 0 {
 		ir.Comp.Options |= OptDebugSleepOnSwitch
 	} else {
 		ir.Comp.Options &^= OptDebugSleepOnSwitch
 	}
-	rets := PackValues(ir.Eval(test.program))
 
+	var rets []r.Value
+	panicking := true
+	if test.result0 == panics {
+		defer func() {
+			if panicking {
+				recover()
+			}
+		}()
+	}
+
+	rets, _ = ir.Eval(test.program)
+	panicking = false
 	test.compareResults(t, rets)
 }
 
@@ -141,6 +172,80 @@ const switch_source_string = `func bigswitch(n int) int {
 	return n
 }`
 
+const interface_interpreted_1_source_string = `
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+)
+
+type R interface {
+	Read([]uint8) (int, error)
+}
+
+type DevNull struct{}
+
+func (d DevNull) Read(b []byte) (int, error) {
+	return 0, io.EOF
+}
+
+type DevZero struct{}
+
+func (d DevZero) Read(b []byte) (int, error) {
+	for i := range b {
+		b[i] = 0
+	}
+	return len(b), nil
+}
+
+true`
+
+const interface_interpreted_2_source_string = `
+(func() bool {
+
+	fail := func(format string, args ...interface{}) {
+		panic(errors.New(fmt.Sprintf(format, args...)))
+	}
+
+	f, _ := os.Open("README.md")
+	bytes := make([]uint8, 80)
+
+	rs := [3]R{f, DevNull{}, DevZero{}}
+	lens := [3]int{80, 0, 80}
+	errs := [3]error{nil, io.EOF, nil}
+
+	for i, r := range rs {
+		len, err := r.Read(bytes)
+		if len != lens[i] || err != errs[i] {
+			fail("Read(): expecting (%v, %v), returned (%v, %v)", lens[i], errs[i], len, err)
+		}
+		j := -1
+		switch r := r.(type) {
+		case *os.File:
+			j = 0
+			if r != rs[i] {
+				fail("typeswitch: expecting %v, found %v", rs[i], r)
+			}
+		case DevNull:
+			j = 1
+			if r != rs[i] {
+				fail("typeswitch: expecting %v, found %v", rs[i], r)
+			}
+		case DevZero:
+			j = 2
+			if r != rs[i] {
+				fail("typeswitch: expecting %v, found %v", rs[i], r)
+			}
+		}
+		if i != j {
+			fail("typeswitch: expecting j=%d, found j=%d", i, j)
+		}
+	}
+	return true
+})()
+`
+
 var (
 	cti = r.StructOf(
 		[]r.StructField{
@@ -150,7 +255,8 @@ var (
 	)
 	fti = r.StructOf(
 		[]r.StructField{
-			r.StructField{Name: StrGensymInterface, Type: r.TypeOf((*xr.InterfaceHeader)(nil)).Elem()},
+			r.StructField{Name: StrGensymInterface, Type: r.TypeOf(xr.InterfaceHeader{})},
+			r.StructField{Name: StrGensymEmbedded, Type: r.TypeOf([0]struct{}{})},
 			r.StructField{Name: "String", Type: r.TypeOf((*func() string)(nil)).Elem()},
 		},
 	)
@@ -169,6 +275,51 @@ func for_range_string(s string) int32 {
 		v0 += r << (uint8(i) * 8)
 	}
 	return v0
+}
+
+func makeQuote(node ast.Node) *ast.UnaryExpr {
+	return makequote2(mt.QUOTE, node)
+}
+
+func makeQUASIQUOTE(node ast.Node) *ast.UnaryExpr {
+	return makequote2(mt.QUASIQUOTE, node)
+}
+
+func makeUNQUOTE(node ast.Node) *ast.UnaryExpr {
+	return makequote2(mt.UNQUOTE, node)
+}
+
+func makeUNQUOTE_SPLICE(node ast.Node) *ast.UnaryExpr {
+	return makequote2(mt.UNQUOTE_SPLICE, node)
+}
+
+func makequote2(op token.Token, node ast.Node) *ast.UnaryExpr {
+	unary, _ := mp.MakeQuote(nil, op, token.NoPos, node)
+	return unary
+}
+
+type Pair = struct { // unnamed!
+	A rune
+	B string
+}
+
+var bigInt = new(big.Int)
+var bigRat = new(big.Rat)
+var bigFloat = new(big.Float)
+
+func init() {
+	bigInt.SetInt64(1)
+	bigInt.Lsh(bigInt, 1000)
+
+	bigRat.SetFrac64(1000000001, 1000000000)
+	bigRat.Mul(bigRat, bigRat)
+	bigRat.Mul(bigRat, bigRat)
+
+	// use the same precision as constant.Value
+	bigFloat.SetPrec(512)
+	bigFloat.SetString("1e1234")
+	bigFloat.Mul(bigFloat, bigFloat)
+	bigFloat.Mul(bigFloat, bigFloat)
 }
 
 var testcases = []TestCase{
@@ -191,12 +342,14 @@ var testcases = []TestCase{
 	TestCase{A, "const_2", "const c2 = 0xff&555+23/12.2; c2", 0xff&555 + 23/12.2, nil},
 
 	// the classic interpreter is not accurate in this cases... missing exact arithmetic on constants
-	TestCase{I, "const_3", "const c3 = 0.1+0.2; c3", float64(0.1) + float64(0.2), nil},
-	TestCase{I, "const_4", "const c4 = c3/3; c4", (float64(0.1) + float64(0.2)) / 3, nil},
+	TestCase{C, "const_3", "const c3 = 0.1+0.2; c3", float64(0.1) + float64(0.2), nil},
+	TestCase{C, "const_4", "const c4 = c3/3; c4", (float64(0.1) + float64(0.2)) / 3, nil},
 
 	// the fast interpreter instead *IS* accurate, thanks to exact arithmetic on untyped constants
 	TestCase{F, "const_3", "const c3 = 0.1+0.2; c3", 0.1 + 0.2, nil},
 	TestCase{F, "const_4", "const c4 = c3/3; c4", (0.1 + 0.2) / 3, nil},
+
+	TestCase{F, "const_complex_1", "const c5 = complex(c3, c4); c5", 0.3 + 0.1i, nil},
 
 	TestCase{F, "untyped_1", "2.0 >> 1", 1, nil},
 	TestCase{A, "untyped_2", "1/2", 0, nil},
@@ -236,8 +389,8 @@ var testcases = []TestCase{
 	TestCase{A, "var_shift_overflow", "v3 << 13", uint16(32768), nil},
 
 	// test division by constant power-of-two
-	TestCase{I, "var_div_1", "v3 = 11; v3 / 2", uint64(11) / 2, nil}, // classic interpreter is not type-accurate here
-	TestCase{I, "var_div_2", "v3 = 63; v3 / 8", uint64(63) / 8, nil},
+	TestCase{C, "var_div_1", "v3 = 11; v3 / 2", uint64(11) / 2, nil}, // classic interpreter is not type-accurate here
+	TestCase{C, "var_div_2", "v3 = 63; v3 / 8", uint64(63) / 8, nil},
 	TestCase{F, "var_div_1", "v3 = 11; v3 / 2", uint16(11) / 2, nil},
 	TestCase{F, "var_div_2", "v3 = 63; v3 / 8", uint16(63) / 8, nil},
 
@@ -255,8 +408,8 @@ var testcases = []TestCase{
 	TestCase{A, "var_div_13", "v0 =-63; v0 /-8", -63 / -8, nil},
 
 	// test remainder by constant power-of-two
-	TestCase{I, "var_rem_1", "v3 = 17; v3 % 4", uint64(17) % 4, nil}, // classic interpreter is not type-accurate here
-	TestCase{I, "var_rem_2", "v3 = 61; v3 % 8", uint64(61) % 8, nil},
+	TestCase{C, "var_rem_1", "v3 = 17; v3 % 4", uint64(17) % 4, nil}, // classic interpreter is not type-accurate here
+	TestCase{C, "var_rem_2", "v3 = 61; v3 % 8", uint64(61) % 8, nil},
 	TestCase{F, "var_rem_1", "v3 = 17; v3 % 4", uint16(17) % 4, nil},
 	TestCase{F, "var_rem_2", "v3 = 61; v3 % 8", uint16(61) % 8, nil},
 
@@ -284,13 +437,15 @@ var testcases = []TestCase{
 
 	TestCase{A, "type_int8", "type t8 int8; var v8 t8; v8", int8(0), nil},
 	TestCase{A, "type_complicated", "type tfff func(int,int) func(error, func(bool)) string; var vfff tfff; vfff", (func(int, int) func(error, func(bool)) string)(nil), nil},
-	TestCase{I, "type_interface", "type Stringer interface { String() string }; var s Stringer; s", csi, nil},
+	TestCase{C, "type_interface", "type Stringer interface { String() string }; var s Stringer; s", csi, nil},
 	TestCase{F, "type_interface", "type Stringer interface { String() string }; var s Stringer; s", fsi, nil},
+	TestCase{F, "type_struct_0", "type PairPrivate struct { a, b rune }; var pp PairPrivate; pp.a+pp.b", rune(0), nil},
 	TestCase{A, "type_struct_1", "type Pair struct { A rune; B string }; var pair Pair; pair", struct {
 		A rune
 		B string
 	}{}, nil},
 	TestCase{A, "type_struct_2", "type Triple struct { Pair; C float32 }; var triple Triple; triple.C", float32(0), nil},
+	TestCase{A, "type_struct_3", "type TripleP struct { *Pair; D float64 }; var tp TripleP; tp.D", float64(0), nil},
 	TestCase{A, "field_get_1", "pair.A", rune(0), nil},
 	TestCase{A, "field_get_2", "pair.B", "", nil},
 	TestCase{F, "field_anonymous_1", "triple.Pair", struct {
@@ -298,7 +453,11 @@ var testcases = []TestCase{
 		B string
 	}{}, nil},
 	TestCase{F, "field_embedded_1", "triple.A", rune(0), nil},
-	TestCase{F, "field_embedded_2", "triple.Pair.B", "", nil},
+	TestCase{F, "field_embedded_2", "triple.B", "", nil},
+	TestCase{F, "field_embedded_3", "triple.Pair.A", rune(0), nil},
+	TestCase{F, "field_embedded_4", "triple.Pair.B", "", nil},
+	TestCase{F, "field_embedded_4", "tp.A", panics, nil},
+	TestCase{F, "field_embedded_5", "tp.Pair = &triple.Pair; tp.B", "", nil},
 
 	TestCase{A, "address_0", "var vf = 1.25; *&vf == vf", true, nil},
 	TestCase{A, "address_1", "var pvf = &vf; *pvf", 1.25, nil},
@@ -357,6 +516,18 @@ var testcases = []TestCase{
 	TestCase{A, "for_1", "var i, j, k int; for i=1; i<=2; i=i+1 { if i<2 {j=i} else {k=i} }; i", 3, nil},
 	TestCase{A, "for_2", "j", 1, nil},
 	TestCase{A, "for_3", "k", 2, nil},
+	TestCase{A, "for_nested", `x := 0
+		{
+			n1, n2, n3 := 2, 3, 5
+			for i := 0; i < n1; i++ {
+				for k := 0; k < n2; k++ {
+					for j := 0; j < n3; j++ {
+						x++
+					}
+				}
+			}
+		}
+		x`, 2 * 3 * 5, nil},
 	TestCase{A, "continue_1", "j=0; k=0; for i:=1; i<=7; i=i+1 { if i==3 {j=i; continue}; k=k+i }; j", 3, nil},
 	TestCase{A, "continue_2", "k", 25, nil},
 	TestCase{A, "continue_3", "j=0; k=0; for i:=1; i<=7; i=i+1 { var ii = i; if ii==3 {j=ii; continue}; k=k+ii }; j", 3, nil},
@@ -431,29 +602,30 @@ var testcases = []TestCase{
 		list_args(i,m,mcopy)`,
 		[]interface{}{1, nil_map_int_string, map[int]string{0: "foo"}}, nil},
 
-	TestCase{A, "field_set_1", `pair.A = 'k'; pair.B = "m"; pair`, struct {
-		A rune
-		B string
-	}{'k', "m"}, nil},
-	TestCase{A, "field_set_2", `pair.A, pair.B = 'x', "y"; pair`, struct {
-		A rune
-		B string
-	}{'x', "y"}, nil},
-	TestCase{F, "field_set_3", `triple.Pair.A, triple.C = 'a', 1.0; triple.Pair`, struct {
-		A rune
-		B string
-	}{'a', ""}, nil},
-	TestCase{F, "field_set_embedded_1", `triple.A, triple.B = 'b', "xy"; triple.Pair`, struct {
-		A rune
-		B string
-	}{'b', "xy"}, nil},
+	TestCase{A, "field_set_1", `pair.A = 'k'; pair.B = "m"; pair`, Pair{'k', "m"}, nil},
+	TestCase{A, "field_set_2", `pair.A, pair.B = 'x', "y"; pair`, Pair{'x', "y"}, nil},
+	TestCase{F, "field_set_3", `triple.Pair.A, triple.C = 'a', 1.0; triple.Pair`, Pair{'a', ""}, nil},
+	TestCase{F, "field_set_embedded_1", `triple.A, triple.B = 'b', "xy"; triple.Pair`, Pair{'b', "xy"}, nil},
 	TestCase{F, "field_addr_1", "ppair := &triple.Pair; ppair.A", 'b', nil},
 	TestCase{F, "field_addr_2", "ppair.A++; triple.Pair.A", 'c', nil},
 
-	TestCase{I, "import", `import ( "fmt"; "time" )`, "time", nil},
-	TestCase{F, "import", `import ( "fmt"; "time" )`, nil, []interface{}{}},
+	TestCase{F, "infer_type_compositelit_1", `[]Pair{{'a', "b"}, {'c', "d"}}`, []Pair{{'a', "b"}, {'c', "d"}}, nil},
+	TestCase{F, "infer_type_compositelit_2", `[]*Pair{{'a', "b"}, {'c', "d"}}`, []*Pair{{'a', "b"}, {'c', "d"}}, nil},
+	TestCase{F, "infer_type_compositelit_3", `[...]Pair{{'e', "f"}, {'g', "h"}}`, [...]Pair{{'e', "f"}, {'g', "h"}}, nil},
+	TestCase{F, "infer_type_compositelit_4", `map[int]Pair{1:{'i', "j"}, 2:{}}`, map[int]Pair{1: {'i', "j"}, 2: {}}, nil},
+	TestCase{F, "infer_type_compositelit_5", `map[int]map[int]int{1:{2:3}}`, map[int]map[int]int{1: {2: 3}}, nil},
+	TestCase{F, "infer_type_compositelit_6", `map[int]*map[int]int{1:{2:3}}`, map[int]*map[int]int{1: {2: 3}}, nil},
+
+	TestCase{A, "import", `import ( "errors"; "fmt"; "io"; "math/big"; "math/rand"; "reflect"; "time" )`, nil, []interface{}{}},
+	TestCase{A, "import_constant", `const micro = time.Microsecond; micro`, time.Microsecond, nil},
+	TestCase{A, "dot_import_1", `import . "errors"`, nil, []interface{}{}},
+	TestCase{A, "dot_import_2", `reflect.ValueOf(New) == reflect.ValueOf(errors.New)`, true, nil}, // a small but very strict check... good
 
 	TestCase{A, "goroutine_1", `go seti(9); time.Sleep(time.Second/50); i`, 9, nil},
+
+	TestCase{F, "big.Int", `(func() *big.Int { return 1<<1000 })()`, bigInt, nil},
+	TestCase{F, "big.Rat", `(func() *big.Rat { var x *big.Rat = 1.000000001; x.Mul(x,x); x.Mul(x,x); return x })()`, bigRat, nil},
+	TestCase{F, "big.Float", `(func() *big.Float { var x *big.Float = 1e1234; x.Mul(x,x); x.Mul(x,x); return x })()`, bigFloat, nil},
 
 	TestCase{A, "builtin_append", "append(vs,0,1,2)", []byte{0, 1, 2}, nil},
 	TestCase{A, "builtin_cap", "cap(va)", 2, nil},
@@ -470,7 +642,7 @@ var testcases = []TestCase{
 	TestCase{A, "builtin_copy_2", "vs", []byte("8y57r"), nil},
 	TestCase{A, "builtin_delete_1", "delete(mi,64); mi", map[rune]byte{'a': 7}, nil},
 	TestCase{A, "builtin_real_1", "real(0.5+1.75i)", real(0.5 + 1.75i), nil},
-	TestCase{A, "builtin_real_2", "var cplx complex64 = 1.5+0.25i; real(cplx)", real(complex64(1.5 + 0.25i)), nil},
+	TestCase{A, "builtin_real_2", "const cplx complex64 = 1.5+0.25i; real(cplx)", real(complex64(1.5 + 0.25i)), nil},
 	TestCase{A, "builtin_imag_1", "imag(0.5+1.75i)", imag(0.5 + 1.75i), nil},
 	TestCase{A, "builtin_imag_2", "imag(cplx)", imag(complex64(1.5 + 0.25i)), nil},
 	TestCase{A, "builtin_complex_1", "complex(0,1)", complex(0, 1), nil},
@@ -490,38 +662,55 @@ var testcases = []TestCase{
 	TestCase{A, "time_utc_set_1", ` time.UTC = nil; time.UTC == nil`, true, nil},
 	TestCase{A, "time_utc_set_2", ` time.UTC = utc; time.UTC.String()`, "UTC", nil},
 
+	TestCase{A, "index_is_named_type", `"abc"[time.Nanosecond]`, uint8('b'), nil},
+	TestCase{A, "panic_at_runtime", `"abc"[micro]`, panics, nil},
+	TestCase{F, "panic_oob_at_compile", `(func() uint8 { return "abc"[micro] })`, panics, nil}, // string index out of range
+	TestCase{F, "panic_non_const_initialization", `const _ = rand.Int()`, panics, nil},         // const initializer is not a constant
+
 	TestCase{A, "literal_array", "[3]int{1,2:3}", [3]int{1, 0, 3}, nil},
 	TestCase{A, "literal_array_address", "&[...]int{3:4,5:6}", &[...]int{3: 4, 5: 6}, nil},
 	TestCase{A, "literal_map", `map[int]string{1: "foo", 2: "bar"}`, map[int]string{1: "foo", 2: "bar"}, nil},
 	TestCase{A, "literal_map_address", `&map[int]byte{6:7, 8:9}`, &map[int]byte{6: 7, 8: 9}, nil},
 	TestCase{A, "literal_slice", "[]rune{'a','b','c'}", []rune{'a', 'b', 'c'}, nil},
 	TestCase{A, "literal_slice_address", "&[]rune{'x','y'}", &[]rune{'x', 'y'}, nil},
-	TestCase{A, "literal_struct", `Pair{A: 0x73, B: "\x94"}`, struct {
-		A rune
-		B string
-	}{A: 0x73, B: "\x94"}, nil},
-	TestCase{A, "literal_struct_address", `&Pair{1,"2"}`, &struct {
-		A rune
-		B string
-	}{A: 1, B: "2"}, nil},
+	TestCase{A, "literal_struct", `Pair{A: 0x73, B: "\x94"}`, Pair{A: 0x73, B: "\x94"}, nil},
+	TestCase{A, "literal_struct_address", `&Pair{1,"2"}`, &Pair{A: 1, B: "2"}, nil},
 
-	TestCase{A, "method_decl_1", `func (p *Pair) SetA(a rune) { p.A = a }; func (p Pair) SetAV(a rune) { p.A = a }; nil`, nil, nil},
+	TestCase{A, "method_decl_1", `func (p *Pair) SetA(a rune) { p.A = a }; nil`, nil, nil},
 	TestCase{A, "method_decl_2", `func (p Pair) SetAV(a rune) { p.A = a }; nil`, nil, nil},
 	TestCase{A, "method_decl_3", `func (p Pair) String() string { return fmt.Sprintf("%c %s", p.A, p.B) }; nil`, nil, nil},
 
 	TestCase{A, "method_on_ptr", `pair.SetA(33); pair.A`, rune(33), nil},
 	TestCase{A, "method_on_val_1", `pair.SetAV(11); pair.A`, rune(33), nil}, // method on value gets a copy of the receiver - changes to not propagate
 	TestCase{A, "method_on_val_2", `pair.String()`, "! y", nil},
-	TestCase{F, "method_embedded_on_ptr", `triple.SetA('+'); triple.A`, '+', nil},
-	TestCase{F, "method_embedded_on_val", `triple.SetAV('*'); triple.A`, '+', nil},
+	TestCase{F, "method_embedded=val_recv=ptr", `triple.SetA('1'); triple.A`, '1', nil},
+	TestCase{F, "method_embedded=val_recv=val", `triple.SetAV('2'); triple.A`, '1', nil},
+	TestCase{F, "method_embedded=ptr_recv=val", `tp.SetAV('3'); tp.A`, '1', nil}, // set by triple.SetA('1') above
+	TestCase{F, "method_embedded=ptr_recv=ptr", `tp.SetA('4'); tp.A`, '4', nil},
+
+	TestCase{F, "concrete_method_to_func", "cf0 := time.Duration.Seconds; cf0(time.Hour)", 3600.0, nil},
+	TestCase{F, "concrete_method_to_closure", "cl1 := time.Hour.Seconds; cl1()", 3600.0, nil},
+
+	// tricky because Comp.compileObjGetMethod() asks for the package path of 'error', which has nil package
+	TestCase{A, "interface_0", `errors.New("abc").Error()`, "abc", nil},
 
 	TestCase{A, "interface_1", "var st fmt.Stringer = time.Second; st", time.Second, nil},
-	TestCase{A, "interface_method_1", "bind := st.String; bind()", "1s", nil},
+	TestCase{A, "interface_method_to_closure_1", "bind := st.String; bind()", "1s", nil},
 	TestCase{F, "interface_2", "st = pair; nil", nil, nil},
-	TestCase{F, "interface_method_2", "bind = st.String; bind()", "! y", nil},
+	TestCase{F, "interface_method_to_closure_2", "bind = st.String; bind()", "! y", nil},
+	TestCase{F, "interface_method_to_closure_3", "st = nil; bind = st.String", panics, nil},
+	// interpreted interface
+	TestCase{F, "interface_3", "type IStringer interface { String() string }; nil", nil, nil},
+	TestCase{F, "interface_method_to_closure_4", "var ist IStringer; nil", nil, nil},
+	TestCase{F, "interface_method_to_closure_5", "ist.String", panics, nil},
 
-	TestCase{F, "concrete_method_to_func", "f1 := time.Duration.Seconds; f1(time.Hour)", 3600.0, nil},
-	TestCase{F, "interface_method_to_func", "f2 := fmt.Stringer.String; f2(time.Hour)", "1h0m0s", nil},
+	TestCase{F, "interface_method_to_func_1", "f1 := fmt.Stringer.String; f1(time.Hour)", "1h0m0s", nil},
+	TestCase{F, "interface_method_to_func_2", "f2 := io.ReadWriter.Read; f2 != nil", true, nil},
+	TestCase{F, "interface_method_to_func_3", "type Fooer interface { Foo() }; Fooer.Foo != nil", true, nil},
+	TestCase{F, "interface_method_to_func_4", "type RW interface { io.Reader; io.Writer }; RW.Read != nil && RW.Write != nil", true, nil},
+
+	TestCase{F, "interface_interpreted_1", interface_interpreted_1_source_string, true, nil},
+	TestCase{F, "interface_interpreted_2", interface_interpreted_2_source_string, true, nil},
 
 	TestCase{A, "multiple_values_1", "func twins(x float32) (float32,float32) { return x, x+1 }; twins(17.0)", nil, []interface{}{float32(17.0), float32(18.0)}},
 	TestCase{A, "multiple_values_2", "func twins2(x float32) (float32,float32) { return twins(x) }; twins2(19.0)", nil, []interface{}{float32(19.0), float32(20.0)}},
@@ -647,6 +836,14 @@ var testcases = []TestCase{
 	TestCase{A, "typeassert_2", `xi.(string)`, nil, []interface{}{"abc", true}},
 	TestCase{A, "typeassert_3", `xi.(int)`, nil, []interface{}{0, false}},
 	TestCase{A, "typeassert_4", `xi = nil; xi.(error)`, nil, []interface{}{error(nil), false}},
+	TestCase{A, "typeassert_5", `xi = 7; xi.(int)+2`, 9, nil},
+	TestCase{F, "typeassert_6", `type T struct { Val int }; func (t T) String() string { return "T" }`, nil, []interface{}{}},
+	TestCase{F, "typeassert_7", `stringer = T{}; nil`, nil, nil},
+	TestCase{F, "typeassert_8", `st1 := stringer.(T); st1`, struct{ Val int }{0}, nil},
+	TestCase{F, "typeassert_9", `stringer.(T)`, nil, []interface{}{struct{ Val int }{0}, true}},
+	// can interpreted type assertions distinguish between emulated named types with identical underlying type?
+	TestCase{F, "typeassert_10", `type U struct { Val int }; func (u U) String() string { return "U" }; nil`, nil, nil},
+	TestCase{F, "typeassert_11", `stringer.(U)`, nil, []interface{}{struct{ Val int }{0}, false}},
 
 	TestCase{A, "quote_1", `~quote{7}`, &ast.BasicLit{Kind: token.INT, Value: "7"}, nil},
 	TestCase{A, "quote_2", `~quote{x}`, &ast.Ident{Name: "x"}, nil},
@@ -655,18 +852,18 @@ var testcases = []TestCase{
 		&ast.ExprStmt{X: &ast.Ident{Name: "b"}},
 	}}, nil},
 	TestCase{A, "quote_4", `~'{"foo"+"bar"}`, &ast.BinaryExpr{
-		Op: token.ADD,
 		X:  &ast.BasicLit{Kind: token.STRING, Value: `"foo"`},
+		Op: token.ADD,
 		Y:  &ast.BasicLit{Kind: token.STRING, Value: `"bar"`},
 	}, nil},
 	TestCase{A, "quasiquote_1", `~quasiquote{1 + ~unquote{2+3}}`, &ast.BinaryExpr{
-		Op: token.ADD,
 		X:  &ast.BasicLit{Kind: token.INT, Value: "1"},
+		Op: token.ADD,
 		Y:  &ast.BasicLit{Kind: token.INT, Value: "5"},
 	}, nil},
 	TestCase{A, "quasiquote_2", `~"{2 * ~,{3<<1}}`, &ast.BinaryExpr{
-		Op: token.MUL,
 		X:  &ast.BasicLit{Kind: token.INT, Value: "2"},
+		Op: token.MUL,
 		Y:  &ast.BasicLit{Kind: token.INT, Value: "6"},
 	}, nil},
 	TestCase{A, "quasiquote_3", `~"{func(int) {}}`, &ast.FuncLit{
@@ -704,12 +901,26 @@ var testcases = []TestCase{
 		&ast.ExprStmt{X: &ast.Ident{Name: "b"}},
 		&ast.ExprStmt{X: &ast.Ident{Name: "one"}},
 	}}, nil},
+	TestCase{A, "unquote_splice_3", `~"~"{zero ; ~,~,@ab ; one}`,
+		makeQUASIQUOTE(&ast.BlockStmt{List: []ast.Stmt{
+			&ast.ExprStmt{X: &ast.Ident{Name: "zero"}},
+			&ast.ExprStmt{X: makeUNQUOTE(&ast.Ident{Name: "a"})},
+			&ast.ExprStmt{X: makeUNQUOTE(&ast.Ident{Name: "b"})},
+			&ast.ExprStmt{X: &ast.Ident{Name: "one"}},
+		}}), nil},
+	TestCase{A, "unquote_splice_4", `~"~"{zero ; ~,@~,@ab ; one}`,
+		makeQUASIQUOTE(&ast.BlockStmt{List: []ast.Stmt{
+			&ast.ExprStmt{X: &ast.Ident{Name: "zero"}},
+			&ast.ExprStmt{X: makeUNQUOTE_SPLICE(&ast.Ident{Name: "a"})},
+			&ast.ExprStmt{X: makeUNQUOTE_SPLICE(&ast.Ident{Name: "b"})},
+			&ast.ExprStmt{X: &ast.Ident{Name: "one"}},
+		}}), nil},
 	TestCase{A, "macro", "~macro second_arg(a,b,c interface{}) interface{} { return b }; v = 98; v", uint32(98), nil},
 	TestCase{A, "macro_call", "second_arg;1;v;3", uint32(98), nil},
 	TestCase{A, "macro_nested", "second_arg;1;{second_arg;2;3;4};5", 3, nil},
-	TestCase{I, "values", "Values(3,4,5)", nil, []interface{}{3, 4, 5}},
+	TestCase{C, "values", "Values(3,4,5)", nil, []interface{}{3, 4, 5}},
 	TestCase{A, "eval", "Eval(~quote{1+2})", 3, nil},
-	TestCase{I, "eval_quote", "Eval(~quote{Values(3,4,5)})", nil, []interface{}{3, 4, 5}},
+	TestCase{C, "eval_quote", "Eval(~quote{Values(3,4,5)})", nil, []interface{}{3, 4, 5}},
 }
 
 func (c *TestCase) compareResults(t *testing.T, actual []r.Value) {

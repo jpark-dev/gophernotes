@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -75,7 +75,7 @@ func (c *Comp) Select(node *ast.SelectStmt, labels []string) {
 			}
 		}
 		chosen, recv, _ := r.Select(cases)
-		env.Binds[idxrecv] = recv
+		env.Vals[idxrecv] = recv
 		ip := ips[chosen]
 		env.IP = ip
 		return env.Code[ip], env
@@ -160,7 +160,7 @@ func (c *Comp) selectCase(clause *ast.CommClause, bind *Bind) selectEntry {
 				if id1 != nil && id1.Name != "_" {
 					idx := bind.Desc.Index()
 					c2.DeclVar0(id1.Name, c.TypeOfBool(), c.exprBool(func(env *Env) bool {
-						return env.Outer.Binds[idx].IsValid()
+						return env.Outer.Vals[idx].IsValid()
 					}))
 				}
 			} else if len(clause.Body) != 0 {
@@ -189,7 +189,7 @@ func (c *Comp) selectCase(clause *ast.CommClause, bind *Bind) selectEntry {
 				}
 				idx := bind.Desc.Index()
 				c.SetPlace(place, token.ASSIGN, c.exprBool(func(env *Env) bool {
-					return env.Binds[idx].IsValid()
+					return env.Vals[idx].IsValid()
 				}))
 			}
 
@@ -200,11 +200,11 @@ func (c *Comp) selectCase(clause *ast.CommClause, bind *Bind) selectEntry {
 
 	case *ast.SendStmt:
 		// ch <- v
-		echan := c.Expr1(node.Chan)
+		echan := c.Expr1(node.Chan, nil)
 		if echan.Type.Kind() != r.Chan {
 			c.Errorf("cannot use %v <%v> as channel in select case", node, echan.Type)
 		}
-		esend := c.Expr1(node.Value)
+		esend := c.Expr1(node.Value, nil)
 		tactual := esend.Type
 		texpected := echan.Type.Elem()
 		if !tactual.AssignableTo(texpected) {
@@ -234,7 +234,7 @@ func (c *Comp) selectRecv(stmt ast.Stmt, node ast.Expr) *Expr {
 			continue
 		case *ast.UnaryExpr:
 			if expr.Op == token.ARROW {
-				e := c.Expr1(expr.X)
+				e := c.Expr1(expr.X, nil)
 				if e.Type.Kind() != r.Chan {
 					c.Errorf("cannot use %v <%v> as channel in select case", node, e.Type)
 				}

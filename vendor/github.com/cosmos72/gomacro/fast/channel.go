@@ -6,7 +6,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -526,7 +526,7 @@ func (c *Comp) Recv1(node *ast.UnaryExpr, xe *Expr) *Expr {
 	return exprFun(telem, fun)
 }
 func (c *Comp) Send(node *ast.SendStmt) {
-	channel := c.Expr1(node.Chan)
+	channel := c.Expr1(node.Chan, nil)
 	t := channel.Type
 	if t.Kind() != r.Chan {
 		c.Errorf("cannot send to non-channel type %v: %v", t, node)
@@ -539,7 +539,7 @@ func (c *Comp) Send(node *ast.SendStmt) {
 	telem := t.Elem()
 	rtelem := telem.ReflectType()
 	kelem := rtelem.Kind()
-	expr := c.Expr1(node.Value)
+	expr := c.Expr1(node.Value, nil)
 	if expr.Const() {
 		expr.ConstTo(telem)
 	} else if expr.Type == nil || !expr.Type.AssignableTo(telem) {

@@ -6,7 +6,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -41,8 +41,8 @@ import (
 func (c *Comp) IndexExpr(node *ast.IndexExpr) *Expr { return c.indexExpr(node, true) }
 func (c *Comp) IndexExpr1(node *ast.IndexExpr) *Expr { return c.indexExpr(node, false) }
 func (c *Comp) indexExpr(node *ast.IndexExpr, multivalued bool) *Expr {
-	obj := c.Expr1(node.X)
-	idx := c.Expr1(node.Index)
+	obj := c.Expr1(node.X, nil)
+	idx := c.Expr1(node.Index, nil)
 	if obj.Untyped() {
 		obj.ConstTo(obj.DefaultType())
 	}
@@ -73,16 +73,19 @@ func (c *Comp) indexExpr(node *ast.IndexExpr, multivalued bool) *Expr {
 		return nil
 	}
 	if obj.Const() && idx.Const() {
-		ret.EvalConst(OptKeepUntyped)
+		ret.EvalConst(COptKeepUntyped)
 	}
 	return ret
 }
 func (c *Comp) vectorIndex(node *ast.IndexExpr, obj *Expr, idx *Expr) *Expr {
-	idxconst := idx.Const()
-	if idxconst {
-		idx.ConstTo(c.TypeOfInt())
-	} else if idx.Type == nil || !idx.Type.AssignableTo(c.TypeOfInt()) {
-		c.Errorf("non-integer %s index: %v <%v>", obj.Type.Kind(), node.Index, idx.Type)
+	k := idx.Type.Kind()
+	cat := base.KindToCategory(k)
+	if cat == r.Int || cat == r.Uint || idx.Untyped() {
+		if !c.TypeOfInt().IdenticalTo(idx.Type) {
+			idx = c.convert(idx, c.TypeOfInt(), node.Index)
+		}
+	} else {
+		c.Errorf("non-integer %s index: %v <%v>", k, node.Index, idx.Type)
 	}
 
 	t := obj.Type
@@ -93,7 +96,7 @@ func (c *Comp) vectorIndex(node *ast.IndexExpr, obj *Expr, idx *Expr) *Expr {
 	t = t.Elem()
 	objfun := obj.AsX1()
 	var fun I
-	if idxconst {
+	if idx.Const() {
 		i := idx.Value.(int)
 		switch t.Kind() {
 		case r.Bool:
@@ -363,7 +366,20 @@ func (c *Comp) stringIndex(node *ast.IndexExpr, obj *Expr, idx *Expr) *Expr {
 			return str[i]
 		}
 	}
-	return c.exprUint8(fun)
+
+	e := c.exprUint8(fun)
+	if obj.Const() && idx.Const() {
+		panicking := true
+		defer func() {
+			if panicking {
+				recover()
+				c.Errorf("string index out of range: %v", node)
+			}
+		}()
+		e.EvalConst(COptKeepUntyped)
+		panicking = false
+	}
+	return e
 }
 func (c *Comp) mapIndex(node *ast.IndexExpr, obj *Expr, idx *Expr) *Expr {
 	t := obj.Type
@@ -881,8 +897,8 @@ func (c *Comp) mapIndex1(node *ast.IndexExpr, obj *Expr, idx *Expr) *Expr {
 	return exprFun(tval, fun)
 }
 func (c *Comp) IndexPlace(node *ast.IndexExpr, opt PlaceOption) *Place {
-	obj := c.Expr1(node.X)
-	idx := c.Expr1(node.Index)
+	obj := c.Expr1(node.X, nil)
+	idx := c.Expr1(node.Index, nil)
 	if obj.Untyped() {
 		obj.ConstTo(obj.DefaultType())
 	}

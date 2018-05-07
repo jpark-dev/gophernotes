@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -66,7 +66,7 @@ type Method struct {
 }
 
 type StructField struct {
-	// Name is the field name.
+	// Name is the field name. If empty, it will be computed from Type name, and Anonymous will be set to true
 	Name string
 	// Pkg is the package that qualifies a lower case (unexported)
 	// field name. It may be nil for upper case (exported) field names.
@@ -74,9 +74,9 @@ type StructField struct {
 	Pkg       *Package
 	Type      Type              // field type
 	Tag       reflect.StructTag // field tag string
-	Offset    uintptr           // offset within struct, in bytes
+	Offset    uintptr           // offset within struct, in bytes. meaningful only if all Deref[] are false
 	Index     []int             // index sequence for reflect.Type.FieldByIndex or reflect.Value.FieldByIndex
-	Anonymous bool              // is an embedded field. Note: embedded field's name should be set to the type's name
+	Anonymous bool              // is an embedded field. If true, Name should be empty or equal to the type's name
 }
 
 type xtype struct {

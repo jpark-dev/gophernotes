@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -26,19 +26,46 @@
 package classic
 
 import (
+	"bufio"
 	"go/ast"
-	r "reflect"
+	"os"
+
+	. "github.com/cosmos72/gomacro/base"
 )
 
-func (env *Env) evalFile(node *ast.File) (r.Value, []r.Value) {
-	env.PackagePath = node.Name.Name
+func (ir *Interp) EvalFile(filePath string, pkgPath string) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		ir.Errorf("error opening file '%s': %v", filePath, err)
+		return
+	}
+	defer file.Close()
 
-	// TODO eval node.Imports
-	var ret r.Value
-	var rets []r.Value
+	savePath := ir.Env.ThreadGlobals.PackagePath
+	saveOpts := ir.Env.Options
+
+	ir.ChangePackage(pkgPath)
+	ir.Env.Options &^= OptShowEval
+
+	defer func() {
+		ir.ChangePackage(savePath)
+		ir.Env.Options = saveOpts
+	}()
+
+	in := bufio.NewReader(file)
+	ir.Repl(in)
+}
+
+func (env *Env) evalFile(node *ast.File) {
+	env.Name = node.Name.Name
+	env.Path = env.Name
+	env.PackagePath = env.Name
+
+	for _, imp := range node.Imports {
+		env.evalImport(imp)
+	}
 
 	for _, decl := range node.Decls {
-		ret, rets = env.evalDecl(decl)
+		env.evalDecl(decl)
 	}
-	return ret, rets
 }

@@ -1,7 +1,7 @@
 /*
  * gomacro - A Go interpreter with Lisp-like macros
  *
- * Copyright (C) 2017 Massimiliano Ghilardi
+ * Copyright (C) 2017-2018 Massimiliano Ghilardi
  *
  *     This program is free software: you can redistribute it and/or modify
  *     it under the terms of the GNU Lesser General Public License as published
@@ -34,56 +34,24 @@ import (
 	"sort"
 
 	. "github.com/cosmos72/gomacro/base"
+	"github.com/cosmos72/gomacro/base/untyped"
 	xr "github.com/cosmos72/gomacro/xreflect"
 )
 
-// opaqueTypeOf returns an xr.Type with the same name and package as r.TypeOf(val) but without fields or methods
-func (g *CompThreadGlobals) opaqueType(rtype r.Type) xr.Type {
-	if k := rtype.Kind(); k != r.Struct {
-		g.Errorf("internal error: unimplemented opaqueTypeOf for kind=%v, expecting kind=Struct", k)
-	}
-	v := g.Universe
-	t := v.NamedOf(rtype.Name(), "fast")
-	t.SetUnderlying(v.TypeOf(struct{}{}))
-	t.UnsafeForceReflectType(rtype)
-	v.ReflectTypes[rtype] = t // also cache Type in g.Universe.ReflectTypes
-	// g.Debugf("initialized opaque type %v <%v> <%v>", t.Kind(), t.GoType(), t.ReflectType())
-	return t
-}
+type I = interface{}
 
 // ================================= Untyped =================================
 
-// UntypedLit represents an untyped literal value, i.e. an untyped constant
-type UntypedLit struct {
-	Kind     r.Kind // default type. matches Obj.Kind() except for rune literals, where Kind == reflect.Int32
-	Obj      constant.Value
-	Universe *xr.Universe
+type UntypedLit = untyped.Lit
+
+func MakeUntypedLit(kind r.Kind, val constant.Value, basicTypes *[]xr.Type) UntypedLit {
+	return untyped.MakeLit(kind, val, basicTypes)
 }
 
 var (
-	untypedZero = UntypedLit{Kind: r.Int, Obj: constant.MakeInt64(0)}
-	untypedOne  = UntypedLit{Kind: r.Int, Obj: constant.MakeInt64(1)}
+	untypedZero = UntypedLit{Kind: r.Int, Val: constant.MakeInt64(0)}
+	untypedOne  = UntypedLit{Kind: r.Int, Val: constant.MakeInt64(1)}
 )
-
-// pretty-print untyped constants
-func (untyp UntypedLit) String() string {
-	obj := untyp.Obj
-	var strkind, strobj interface{} = untyp.Kind, nil
-	if untyp.Kind == r.Int32 {
-		strkind = "rune"
-		if obj.Kind() == constant.Int {
-			if i, exact := constant.Int64Val(obj); exact {
-				if i >= 0 && i <= 0x10FFFF {
-					strobj = fmt.Sprintf("%q", i)
-				}
-			}
-		}
-	}
-	if strobj == nil {
-		strobj = obj.ExactString()
-	}
-	return fmt.Sprintf("{%v %v}", strkind, strobj)
-}
 
 // ================================= Lit =================================
 
@@ -152,6 +120,34 @@ func (lit Lit) String() string {
 	}
 }
 
+// ================================= EFlags =================================
+
+// EFlags represents the flags of an expression
+type EFlags uint32
+
+const (
+	EIsNil EFlags = 1 << iota
+	EIsTypeAssert
+)
+
+func (f EFlags) IsNil() bool {
+	return f&EIsNil != 0
+}
+
+func MakeEFlag(flag bool, iftrue EFlags) EFlags {
+	if flag {
+		return iftrue
+	}
+	return 0
+}
+
+func EFlag4Value(value I) EFlags {
+	if value == nil {
+		return EIsNil
+	}
+	return 0
+}
+
 // ================================= Expr =================================
 
 // Expr represents an expression in the "compiler"
@@ -160,11 +156,11 @@ type Expr struct {
 	Types []xr.Type // in case the expression produces multiple values. if nil, use Lit.Type.
 	Fun   I         // function that evaluates the expression at runtime.
 	Sym   *Symbol   // in case the expression is a symbol
-	IsNil bool
+	EFlags
 }
 
 func (e *Expr) Const() bool {
-	return e.Value != nil || e.IsNil
+	return e.Value != nil || e.IsNil()
 }
 
 // NumOut returns the number of values that an expression will produce when evaluated
@@ -181,14 +177,6 @@ func (e *Expr) Out(i int) xr.Type {
 		return e.Type
 	}
 	return e.Types[i]
-}
-
-// Outs returns the types that an expression will produce when evaluated
-func (e *Expr) Outs() []xr.Type {
-	if e.Types == nil {
-		return []xr.Type{e.Type}
-	}
-	return e.Types
 }
 
 func (e *Expr) String() string {
@@ -224,7 +212,7 @@ type Builtin struct {
 
 // ================================= Function =================================
 
-// Function represents a function that accesses *CompEnv in the fast interpreter
+// Function represents a function that accesses *Interp in the fast interpreter
 type Function struct {
 	Fun  interface{}
 	Type xr.Type
@@ -240,10 +228,13 @@ type Macro struct {
 
 // ================================= BindClass =================================
 
-type BindClass int
+// BindDescriptor uses two bits to store the class.
+// use all remaining bits as unsigned => we lose only one bit
+// when representing non-negative ints
+type BindClass uint
 
 const (
-	ConstBind = BindClass(iota)
+	ConstBind BindClass = iota
 	FuncBind
 	VarBind
 	IntBind
@@ -262,7 +253,8 @@ func (class BindClass) String() string {
 
 // ================================== BindDescriptor =================================
 
-// the zero value of BindDescriptor is a valid descriptor for all constants
+// the zero value of BindDescriptor is a valid descriptor for all constants,
+// and also for functions and variables named "_"
 type BindDescriptor BindClass
 
 const (
@@ -273,7 +265,7 @@ const (
 	ConstBindDescriptor = BindDescriptor(ConstBind) // bind descriptor for all constants
 )
 
-func MakeBindDescriptor(class BindClass, index int) BindDescriptor {
+func (class BindClass) MakeDescriptor(index int) BindDescriptor {
 	class &= bindClassMask
 	return BindDescriptor(index<<bindIndexShift | int(class))
 }
@@ -325,7 +317,7 @@ func (bind *Bind) ConstValue() r.Value {
 }
 
 func (c *Comp) BindUntyped(value UntypedLit) *Bind {
-	value.Universe = c.Universe
+	value = MakeUntypedLit(value.Kind, value.Val, &c.Universe.BasicTypes)
 	return &Bind{Lit: Lit{Type: c.TypeOfUntypedLit(), Value: value}, Desc: ConstBindDescriptor}
 }
 
@@ -393,7 +385,7 @@ type Place struct {
 	// For map[key], Fun returns the map itself (which may NOT be settable).
 	// Call Fun only once, it may have side effects!
 	Fun func(*Env) r.Value
-	// Fddr is nil for variables.
+	// Addr is nil for variables.
 	// For non-variables, it will return the address of the place.
 	// For map[key], it is nil since map[key] is not addressable
 	// Call Addr only once, it may have side effects!
@@ -422,33 +414,14 @@ func (opt PlaceOption) String() string {
 	}
 }
 
-// ================================= Import =================================
-
-// Import represents an imported package
-type Import struct {
-	// no need to split compile-time bind descriptors map from runtime values slice,
-	// because an import is a singleton - cannot be "instantiated" multiple times.
-	// Instead function or block activation record (*Env) can:
-	// think about goroutines, recursive functions or even loops.
-	Binds      map[string]r.Value
-	BindTypes  map[string]xr.Type
-	Types      map[string]xr.Type
-	Name, Path string
-}
-
 // ================================== Comp, Env =================================
 
 type CompileOptions int
 
 const (
-	OptKeepUntyped CompileOptions = 1 << iota // if set, Compile() on expressions will keep all untyped constants as such (in expressions where Go compiler would compute an untyped constant too)
-	OptIsCompiled                             // if set, packages is at least partially compiled. Effect: variables may be pre-existing, so Comp.intBinds cannot be used
-	OptDefaults    CompileOptions = 0
+	COptKeepUntyped CompileOptions = 1 << iota // if set, Compile() on expressions will keep all untyped constants as such (in expressions where Go compiler would compute an untyped constant too)
+	COptDefaults    CompileOptions = 0
 )
-
-func (opts CompileOptions) IsCompiled() bool {
-	return opts&OptIsCompiled != 0
-}
 
 type Code struct {
 	List       []Stmt
@@ -478,50 +451,121 @@ const (
 	PoolCapacity = 32
 )
 
+type ExecFlags uint
+
+const (
+	EFStartDefer ExecFlags = 1 << iota // true next executed function body is a defer
+	EFDefer                            // function body being executed is a defer
+	EFDebug                            // function body is executed with debugging enabled
+)
+
+func (ef ExecFlags) StartDefer() bool {
+	return ef&EFStartDefer != 0
+}
+
+func (ef ExecFlags) IsDefer() bool {
+	return ef&EFDefer != 0
+}
+
+func (ef ExecFlags) IsDebug() bool {
+	return ef&EFDebug != 0
+}
+
+func (ef *ExecFlags) SetDefer(flag bool) {
+	if flag {
+		(*ef) |= EFDefer
+	} else {
+		(*ef) &^= EFDefer
+	}
+}
+
+func (ef *ExecFlags) SetStartDefer(flag bool) {
+	if flag {
+		(*ef) |= EFStartDefer
+	} else {
+		(*ef) &^= EFStartDefer
+	}
+}
+
+func (ef *ExecFlags) SetDebug(flag bool) {
+	if flag {
+		(*ef) |= EFDebug
+	} else {
+		(*ef) &^= EFDebug
+	}
+}
+
+type Debugger interface {
+	Breakpoint(ir *Interp, env *Env) DebugOp
+	At(ir *Interp, env *Env) DebugOp
+}
+
 // ThreadGlobals contains per-goroutine interpreter runtime bookeeping information
 type ThreadGlobals struct {
+	*Globals
 	FileEnv      *Env
 	TopEnv       *Env
 	Interrupt    Stmt
-	Signal       Signal // set by interrupts: Return, Defer...
+	Signals      Signals // set by defer, return, breakpoint, debugger and ThreadGlobals.interrupt(os.Signal)
 	PoolSize     int
 	Pool         [PoolCapacity]*Env
 	InstallDefer func()      // defer function to be installed
 	Panic        interface{} // current panic. needed for recover()
 	PanicFun     *Env        // the currently panicking function
 	DeferOfFun   *Env        // function whose defer are running
-	StartDefer   bool        // true if next executed function body is a defer
-	IsDefer      bool        // true if function body being executed is a defer
-	*Globals
+	ExecFlags    ExecFlags
+	CmdOpt       CmdOpt
+	DebugDepth   int // depth of function to debug with single-step
+	CallDepth    int // depth of call stack. updated ONLY at function entry. use env.CallDepth instead
+	Debugger     Debugger
 }
 
-// CompGlobals contains per-goroutine interpreter compile bookeeping information
-type CompThreadGlobals struct {
+// CompGlobals contains interpreter compile bookeeping information
+type CompGlobals struct {
+	*Globals
 	Universe     *xr.Universe
+	KnownImports map[string]*Import // map[path]*Import cache of known imports
 	interf2proxy map[r.Type]r.Type  // interface -> proxy
 	proxy2interf map[r.Type]xr.Type // proxy -> interface
-	*Globals
+	Prompt       string
+}
+
+func (cg *CompGlobals) CompileOptions() CompileOptions {
+	var opts CompileOptions
+	if cg.Options&OptKeepUntyped != 0 {
+		opts = COptKeepUntyped
+	}
+	return opts
+}
+
+type CompBinds struct {
+	Binds      map[string]*Bind
+	BindNum    int // len(Binds) == BindNum + IntBindNum + # of constants
+	IntBindNum int
+	// if address of some Env.Ints[index] was taken, we must honor it:
+	// we can no longer reallocate Env.Ints[], thus we cannot declare IntBind variables
+	// beyond Env.Ints[] capacity. In such case, we set IntBindMax to cap(Env.Ints):
+	// Comp.AddBind() will allocate IntBind variables only up to IntBindMax,
+	// then switch and allocate them as VarBind instead (they are slower and each one allocates memory)
+	IntBindMax int
+	Types      map[string]xr.Type
+	Name       string // set by "package" directive
+	Path       string
 }
 
 // Comp is a tree-of-closures builder: it transforms ast.Nodes into closures
 // for faster execution. Consider it a poor man's compiler (hence the name)
 type Comp struct {
-	Binds      map[string]*Bind
-	BindNum    int // len(Binds) == BindNum + IntBindNum + # of constants
-	IntBindNum int
+	*CompGlobals
+	CompBinds
 	// UpCost is the number of *Env.Outer hops to perform at runtime to reach the *Env corresponding to *Comp.Outer
 	// usually equals one. will be zero if this *Comp defines no local variables/functions.
-	UpCost         int
-	Depth          int
-	Types          map[string]xr.Type
-	Code           Code      // "compiled" code
-	Loop           *LoopInfo // != nil when compiling a for or switch
-	Func           *FuncInfo // != nil when compiling a function
-	Outer          *Comp
-	Name           string // set by "package" directive
-	Path           string
-	CompileOptions CompileOptions
-	*CompThreadGlobals
+	UpCost int
+	Depth  int
+	Code   Code      // "compiled" code
+	Loop   *LoopInfo // != nil when compiling a for or switch
+	Func   *FuncInfo // != nil when compiling a function
+	Outer  *Comp
 }
 
 const (
@@ -531,47 +575,37 @@ const (
 	TopDepth  = -3
 )
 
-type Signal int
+// ================================= Env =================================
 
-const (
-	SigNone Signal = iota
-	SigReturn
-	SigDefer // request to install a defer function
-)
+type EnvBinds struct {
+	Vals []r.Value
+	Ints []uint64
+}
 
 // Env is the interpreter's runtime environment
 type Env struct {
-	Binds         []r.Value
-	IntBinds      []uint64
-	Outer         *Env
-	IP            int
-	Code          []Stmt
-	DebugPos      []token.Pos // for debugging interpreted code: position of each statement
-	ThreadGlobals *ThreadGlobals
-	UsedByClosure bool // a bitfield would introduce more races among goroutines
-	AddressTaken  bool // true if &Env.IntBinds[index] was executed... then we cannot reuse IntBinds
+	EnvBinds
+	Outer           *Env
+	IP              int
+	Code            []Stmt
+	ThreadGlobals   *ThreadGlobals
+	DebugPos        []token.Pos // for debugging interpreted code: position of each statement
+	DebugComp       *Comp       // for debugging interpreted code: compiler with Binds, and to rebuild an Interp if needed
+	CallDepth       int         // for debugging interpreted code: depth of call stack
+	UsedByClosure   bool        // a bitfield would introduce more races among goroutines
+	IntAddressTaken bool        // true if &Env.Ints[index] was executed... then we cannot reuse or reallocate Ints
 }
 
-type (
-	I interface{}
-	/*
-		XBool func(*Env) bool
-		XInt        func(*Env) int
-		XInt8       func(*Env) int8
-		XInt16      func(*Env) int16
-		XInt32      func(*Env) int32
-		XInt64      func(*Env) int64
-		XUint       func(*Env) uint
-		XUint8      func(*Env) uint8
-		XUint16     func(*Env) uint16
-		XUint32     func(*Env) uint32
-		XUint64     func(*Env) uint64
-		XUintptr    func(*Env) uintptr
-		XFloat32    func(*Env) float32
-		XFloat64    func(*Env) float64
-		XComplex64  func(*Env) complex64
-		XComplex128 func(*Env) complex128
-		XString     func(*Env) string
-		XV          func(*Env) (r.Value, []r.Value)
-	*/
-)
+// ================================= Import =================================
+
+// Import represents an imported package.
+// we cannot name it "Package" because it conflicts with ast2.Package
+type Import struct {
+	// model as a combination of CompBinds and EnvBinds, because to support the command 'package PATH'
+	// we must convert Comp+Env to Import and vice-versa.
+	// This has the added benefit of allowing packages to freely mix
+	// interpreted and compiled constants, functions, variables and types.
+	CompBinds
+	*EnvBinds
+	env *Env
+}
