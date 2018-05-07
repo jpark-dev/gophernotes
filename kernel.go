@@ -259,6 +259,10 @@ func handleShellMsg(ir *interp.Interp, receipt msgReceipt) {
 		if err := sendKernelInfo(receipt); err != nil {
 			log.Fatal(err)
 		}
+	case "complete_request":
+        if err := handleCompleteRequest(ir, receipt); err != nil {
+            log.Fatal(err)
+        }
 	case "execute_request":
 		if err := handleExecuteRequest(ir, receipt); err != nil {
 			log.Fatal(err)
@@ -433,16 +437,12 @@ func doEval(ir *interp.Interp, code string) (val []interface{}, err error) {
 	compiledSrc := ir.CompileAst(srcAst)
 
 	// Evaluate the code.
-	result, results := ir.RunExpr(compiledSrc)
+	results, _ := ir.RunExpr(compiledSrc)
 
 	// If the source ends with an expression, then the result of the execution is the value of the expression. In the
 	// event that all return values are nil, the result is also nil.
 	if srcEndsWithExpr {
-		// `len(results) == 0` implies a single result stored in `result`.
 		if len(results) == 0 {
-			if val := base.ValueInterface(result); val != nil {
-				return []interface{}{val}, nil
-			}
 			return nil, nil
 		}
 
